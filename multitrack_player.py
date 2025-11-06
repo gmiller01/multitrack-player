@@ -1,39 +1,56 @@
 #!/usr/bin/env python3
-# multitrack_player_v8.py
-# Multitrack Player v8 - PyQt6, Python 3.12
-# - Linear per-track volume 0..120 (default 100)
-# - Per-track Mute & Solo (Solo overrides Mute)
-# - Loop: when toggled ON playback jumps to loop start; loop repeats
-# - 4-tick count-in before playback with user-set BPM and selectable tick file
-# - Save/load per-folder settings to multitrack_config.json
-# - Timeline with draggable playhead and loop handles
+# multitrack_player_v10.py
+# Multitrack Player v10 - PyQt6, Python 3.12
+# Realtime global pitch shift (rubberband/scaletempo via mpv af), ticks via pygame.mixer,
+# loop save/overwrite/delete, per-track volume/mute/solo, JSON per-folder settings.
 #
 # Usage:
-#   python3 multitrack_player_v8.py
+#   python3 multitrack_player_v10.py
 
+import os
 import locale
+
+# Ensure C numeric locale for libmpv (prevents Non-C locale segfaults)
 locale.setlocale(locale.LC_NUMERIC, "C")
-import os, sys, json, time, math, subprocess
 os.environ["LC_NUMERIC"] = "C"
+
+import sys
+import json
+import time
+import math
+import subprocess
+import threading
 from pathlib import Path
+from typing import Optional, Dict
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QScrollArea, QMessageBox, QComboBox,
     QCheckBox, QInputDialog, QSpinBox, QLineEdit
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF, QPointF
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF, QPointF, QUrl
 from PyQt6.QtGui import QPainter, QColor, QPen
+
+# pygame used for low-latency tick playback in a separate thread
+try:
+    import pygame
+    PYGAME_AVAILABLE = True
+except Exception:
+    PYGAME_AVAILABLE = False
 
 try:
     import mpv
 except Exception:
     mpv = None
 
+# Constants
 SETTINGS_NAME = "multitrack_config.json"
 AUDIO_EXTS = ('.wav', '.mp3', '.flac', '.ogg', '.m4a')
 DEFAULT_BPM = 120
-DEFAULT_TICK = None  # if None, built-in beep will be used
+DEFAULT_TICK_VOL = 80  # percentage for tick sound
+PITCH_ENGINE_OPTIONS = ["rubberband", "scaletempo"]
+DEFAULT_PITCH_ENGINE = "rubberband"
+
 
 def list_pactl_sinks():
     try:
@@ -48,9 +65,14 @@ def list_pactl_sinks():
             sinks.append((idx, name, desc))
     return sinks
 
-# Map slider 0..120 linearly to mpv percent (0..120)
+
 def slider_to_mpv_volume_linear(slider_value: int) -> float:
     return float(slider_value)
+
+
+def semitone_to_scale(semitones: int) -> float:
+    return 2.0 ** (float(semitones) / 12.0)
+
 
 # ---------------------------
 # TrackPlayer wrapper (mpv)
@@ -63,11 +85,12 @@ class TrackPlayer:
         self.is_playing = False
         self.create_player()
 
-    def create_player(self, volume=100.0, pitch=1.0):
+    def create_player(self, volume=100.0):
         opts = {'no_video': True, 'volume': volume, 'keep-open': True, 'msg-level': 'all=no'}
         try:
             self.player = mpv.MPV(**opts) if mpv else None
         except Exception:
+            # fallback to simple creation
             try:
                 self.player = mpv.MPV() if mpv else None
                 if self.player:
@@ -83,11 +106,12 @@ class TrackPlayer:
         if not self.player:
             return
         try:
+            # PulseAudio device by name
             self.player.set_property('audio-device', f"pulse/{sink_name}")
         except Exception:
             pass
 
-    def set_volume(self, vol_pct):
+    def set_volume(self, vol_pct: float):
         if self.player:
             try:
                 self.player.set_property('volume', float(vol_pct))
@@ -97,28 +121,45 @@ class TrackPlayer:
                 except Exception:
                     pass
 
-    def set_pitch_filter(self, pitch):
+    def apply_pitch_af(self, semitones: int, engine: str):
+        """
+        Apply an audio filter (af) chain to perform pitch shift without changing tempo.
+        Using 'rubberband' if available (pitch-scale), else a scaletempo/asetrate chain.
+        """
         if not self.player:
             return False
-        af_str = f"rubberband=pitch-scale={pitch}"
+        scale = semitone_to_scale(int(semitones))
+        if engine == "rubberband":
+            af = f"rubberband=pitch-scale={scale},tempo-scale=1.0"
+        else:
+            # scaletempo approach: asetrate * scale -> scaletempo -> aresample
+            # Note: sample rate hardcoded to 48000 in chain; if files differ, mpv/a resample may handle it
+            af = f"asetrate=48000*{scale},scaletempo,aresample=48000"
         try:
+            # clear previous filters and add new
             try:
-                self.player.command('af', 'add', af_str)
-                return True
+                self.player.command('af', 'clear')
             except Exception:
                 pass
             try:
-                self.player.set_property('af', af_str)
+                # Use 'af add' — should apply immediately in mpv
+                self.player.command('af', 'add', af)
                 return True
             except Exception:
-                return False
+                try:
+                    self.player.set_property('af', af)
+                    return True
+                except Exception:
+                    return False
         except Exception:
             return False
 
-    def play(self, start_pos=0.0, speed=1.0):
+    def play(self, start_pos: float = 0.0, speed: float = 1.0):
         if not self.player:
             self.create_player()
         try:
+            # ensure any AF is applied before play
+            # note: apply_pitch_af should have been called already by main window
             self.player.play(self.file_path)
             if start_pos and start_pos > 0.0:
                 time.sleep(0.02)
@@ -159,7 +200,7 @@ class TrackPlayer:
                 pass
         self.is_playing = True
 
-    def get_time_pos(self):
+    def get_time_pos(self) -> float:
         if not self.player:
             return 0.0
         try:
@@ -168,7 +209,7 @@ class TrackPlayer:
         except Exception:
             return 0.0
 
-    def seek(self, seconds):
+    def seek(self, seconds: float):
         if not self.player:
             return
         try:
@@ -176,7 +217,7 @@ class TrackPlayer:
         except Exception:
             pass
 
-    def get_duration(self):
+    def get_duration(self) -> float:
         if not self.player:
             return 0.0
         try:
@@ -185,48 +226,76 @@ class TrackPlayer:
         except Exception:
             return 0.0
 
-# A külön tick lejátszásra egy kis wrapper
-class TickPlayer:
-    def __init__(self, tick_file=None):
-        self.tick_file = tick_file
-        self.player = None
-        self.create_player()
-
-    def create_player(self):
-        try:
-            self.player = mpv.MPV(**({'no_video': True, 'msg-level': 'all=no'})) if mpv else None
-        except Exception:
-            try:
-                self.player = mpv.MPV() if mpv else None
-            except Exception:
-                self.player = None
-
-    def set_tick_file(self, tick_file):
-        self.tick_file = tick_file
-
-    def play_tick(self):
-        if not self.player:
-            self.create_player()
-        if not self.tick_file:
-            # use system beep fallback: try a shortplay via 'paplay' or simple print
-            try:
-                # attempt paplay (PulseAudio) if available
-                subprocess.Popen(['paplay', '/usr/share/sounds/alsa/Front_Center.wav'])
-            except Exception:
-                pass
-            return
-        try:
-            # play the file (async)
-            self.player.play(self.tick_file)
-        except Exception:
-            # fallback to subprocess player
-            try:
-                subprocess.Popen(['mpv', '--no-video', '--really-quiet', self.tick_file])
-            except Exception:
-                pass
 
 # ---------------------------
-# Timeline widget
+# Tick player using pygame in background thread (preferred)
+# ---------------------------
+class TickPlayer:
+    def __init__(self, tick_file: Optional[str] = None, tick_volume: int = DEFAULT_TICK_VOL):
+        self.tick_file = tick_file
+        self.tick_volume = int(tick_volume)
+        self._inited = False
+        if PYGAME_AVAILABLE:
+            try:
+                # small buffer for low latency
+                pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+                self._inited = True
+            except Exception:
+                self._inited = False
+        # pre-load sound if possible
+        self.sound = None
+        if self._inited and self.tick_file and Path(self.tick_file).exists():
+            try:
+                self.sound = pygame.mixer.Sound(self.tick_file)
+                self.sound.set_volume(max(0.0, min(1.0, self.tick_volume / 100.0)))
+            except Exception:
+                self.sound = None
+
+    def set_tick_file(self, tick_file: Optional[str]):
+        self.tick_file = tick_file
+        if self._inited:
+            try:
+                if self.tick_file and Path(self.tick_file).exists():
+                    self.sound = pygame.mixer.Sound(self.tick_file)
+                    self.sound.set_volume(max(0.0, min(1.0, self.tick_volume / 100.0)))
+                else:
+                    self.sound = None
+            except Exception:
+                self.sound = None
+
+    def set_tick_volume(self, vol_percent: int):
+        self.tick_volume = int(vol_percent)
+        if self.sound:
+            try:
+                self.sound.set_volume(max(0.0, min(1.0, self.tick_volume / 100.0)))
+            except Exception:
+                pass
+
+    def play_tick(self):
+        # Try pygame first (low latency)
+        if self._inited and self.sound:
+            try:
+                self.sound.play()
+                return True
+            except Exception:
+                pass
+        # fallback to mpv subprocess if tick file exists
+        if self.tick_file and Path(self.tick_file).exists():
+            try:
+                subprocess.Popen(['mpv', '--no-video', '--really-quiet', f'--volume={self.tick_volume}', self.tick_file])
+                return True
+            except Exception:
+                pass
+        # fallback to paplay default sound
+        try:
+            subprocess.Popen(['paplay', '/usr/share/sounds/alsa/Front_Center.wav'])
+            return True
+        except Exception:
+            return False
+
+
+# ---------------------------
+# Timeline Widget (same as before)
 # ---------------------------
 class Timeline(QWidget):
     seekRequested = pyqtSignal(float)
@@ -268,27 +337,34 @@ class Timeline(QWidget):
         p.setBrush(QColor("#2f2f2f"))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(bar_rect, 4.0, 4.0)
+
         def x_for(t):
             return 10.0 + (w - 20.0) * (t / self.duration)
+
         lsx = x_for(self.loop_start)
         lex = x_for(self.loop_end)
+
         loop_rect = QRectF(lsx, bar_y, max(4.0, lex - lsx), bar_h)
         p.setBrush(QColor(80, 160, 200, 120))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(loop_rect)
+
         posx = x_for(self.position)
         prog_rect = QRectF(10.0, bar_y, max(2.0, posx - 10.0), bar_h)
         p.setBrush(QColor("#66bb6a"))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(prog_rect)
+
         handle_w = 10.0; handle_h = 18.0
         p.setBrush(QColor("#bbbbbb"))
         p.setPen(QPen(QColor("#888888")))
         handle1 = QRectF(lsx - handle_w / 2.0, bar_y - handle_h / 2.0 + bar_h / 2.0, handle_w, handle_h)
         handle2 = QRectF(lex - handle_w / 2.0, bar_y - handle_h / 2.0 + bar_h / 2.0, handle_w, handle_h)
         p.drawRect(handle1); p.drawRect(handle2)
+
         p.setPen(QPen(QColor("#ffffff"), 2))
         p.drawLine(QPointF(posx, bar_y - 6.0), QPointF(posx, bar_y + bar_h + 6.0))
+
         p.setPen(QPen(QColor("#e6e6e6")))
         p.drawText(10, int(bar_y - 8.0), f"{self._fmt(self.position)}")
         p.drawText(int(w - 80.0), int(bar_y - 8.0), f"{self._fmt(self.duration)}")
@@ -333,8 +409,9 @@ class Timeline(QWidget):
     def mouseReleaseEvent(self, ev):
         self.dragging = None
 
+
 # ---------------------------
-# TrackRow widget
+# TrackRow UI
 # ---------------------------
 class TrackRow(QWidget):
     def __init__(self, filename, sinks, assigned_sink=None, settings=None):
@@ -370,15 +447,13 @@ class TrackRow(QWidget):
         name = Path(self.filename).name
         entry = self.settings.get(name, {})
         vol = entry.get('volume', 100)
-        self.vol_slider.setValue(int(vol))
-        self.current_volume_slider_value = int(vol)
-        self.muted = bool(entry.get('mute', False))
-        self.solo = bool(entry.get('solo', False))
+        self.vol_slider.setValue(int(vol)); self.current_volume_slider_value = int(vol)
+        self.muted = bool(entry.get('mute', False)); self.solo = bool(entry.get('solo', False))
         self.mute_cb.setChecked(self.muted); self.solo_cb.setChecked(self.solo)
         sink = entry.get('sink')
         if sink:
-            idx = self.sink_combo.findData(sink)
-            if idx != -1: self.sink_combo.setCurrentIndex(idx)
+            idx2 = self.sink_combo.findData(sink)
+            if idx2 != -1: self.sink_combo.setCurrentIndex(idx2)
         try:
             pv = slider_to_mpv_volume_linear(self.current_volume_slider_value)
             self.player.set_volume(pv)
@@ -399,8 +474,7 @@ class TrackRow(QWidget):
         sink = self.sink_combo.currentData(); self.player.set_sink(sink)
 
     def _on_volume_changed(self, val):
-        self.current_volume_slider_value = int(val)
-        self.vol_label.setText(f"{int(val)}%")
+        self.current_volume_slider_value = int(val); self.vol_label.setText(f"{int(val)}%")
         try:
             pv = slider_to_mpv_volume_linear(self.current_volume_slider_value)
             self.player.set_volume(pv)
@@ -413,36 +487,40 @@ class TrackRow(QWidget):
     def _on_solo_toggled(self, state):
         self.solo = bool(state)
 
+
 # ---------------------------
-# Main application window
+# MainWindow
 # ---------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Multitrack Player v8 - PyQt6")
-        self.resize(1180, 840)
+        self.setWindowTitle("Multitrack Player v10 - PyQt6")
+        self.resize(1220, 860)
         self.setStyleSheet("""
             QWidget { background-color: #2f2f2f; color: #e6e6e6; }
             QPushButton { background-color: #444444; border: none; padding: 6px; border-radius: 6px; }
             QPushButton:hover { background-color: #555555; }
-            QSlider::groove:horizontal { height: 6px; background: #444; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #888; width: 12px; margin: -6px 0; border-radius: 6px; }
-            QComboBox { background-color: #3a3a3a; padding: 3px; }
-            """)
+            QComboBox, QSpinBox, QLineEdit { background-color: #3a3a3a; padding: 3px; }
+        """)
+
         self.sinks = list_pactl_sinks()
-        self.settings = {}
-        self.current_folder = None
+        self.settings: Dict = {}
+        self.current_folder: Optional[Path] = None
         self.track_rows = []
         self.global_players = []
-        self.global_pitch = 1.0
-        self.loop_list = []
+        self.global_pitch_semitones = 0
+        self.global_pitch_engine = DEFAULT_PITCH_ENGINE
+        self.global_playback_rate = 1.0
+        self.loop_list: Dict[str, list] = {}
         self.current_loop = None
 
-        # count-in / bpm / tick
+        # ticks
         self.bpm = DEFAULT_BPM
-        self.tick_file = DEFAULT_TICK
+        self.tick_file = None
+        self.tick_volume = DEFAULT_TICK_VOL
         self.countin_enabled = True
-        self.tick_player = TickPlayer(self.tick_file)
+        self.tick_count = 4
+        self.tick_player = TickPlayer(self.tick_file, tick_volume=self.tick_volume)
 
         central = QWidget(); self.setCentralWidget(central); v = QVBoxLayout(); central.setLayout(v)
 
@@ -454,29 +532,40 @@ class MainWindow(QMainWindow):
         self.save_btn = QPushButton("Save Settings"); top.addWidget(self.save_btn)
         v.addLayout(top)
 
-        # timeline & transport
+        # timeline and transport
         self.timeline = Timeline(duration=10.0); v.addWidget(self.timeline)
         transport = QHBoxLayout()
         self.play_btn = QPushButton("Play"); transport.addWidget(self.play_btn)
         self.pause_btn = QPushButton("Pause"); transport.addWidget(self.pause_btn)
         self.stop_btn = QPushButton("Stop"); transport.addWidget(self.stop_btn)
-        transport.addWidget(QLabel("Pitch"))
-        self.pitch_slider = QSlider(Qt.Orientation.Horizontal); self.pitch_slider.setRange(50,200); self.pitch_slider.setValue(100)
-        transport.addWidget(self.pitch_slider, 2)
-        self.pitch_label = QLabel("1.00x"); transport.addWidget(self.pitch_label)
+        transport.addWidget(QLabel("Pitch engine:"))
+        self.pitch_engine_combo = QComboBox()
+        for e in PITCH_ENGINE_OPTIONS: self.pitch_engine_combo.addItem(e, e)
+        transport.addWidget(self.pitch_engine_combo)
+        transport.addWidget(QLabel("Global pitch (semitones):"))
+        self.global_pitch_combo = QComboBox()
+        for s in range(-12, 13): self.global_pitch_combo.addItem(f"{s:+d}", s)
+        transport.addWidget(self.global_pitch_combo)
+        transport.addWidget(QLabel("Playback rate:"))
+        self.playback_rate_label = QLabel("1.00x"); transport.addWidget(self.playback_rate_label)
         v.addLayout(transport)
 
-        # loop + countin controls
+        # loop & tick controls
         loop_h = QHBoxLayout()
         self.loop_toggle = QCheckBox("Loop On"); loop_h.addWidget(self.loop_toggle)
         self.loop_save_btn = QPushButton("Save Loop"); loop_h.addWidget(self.loop_save_btn)
+        self.loop_delete_btn = QPushButton("Delete Loop"); loop_h.addWidget(self.loop_delete_btn)
         self.loop_select = QComboBox(); loop_h.addWidget(self.loop_select, 1)
         loop_h.addWidget(QLabel("BPM:"))
         self.bpm_spin = QSpinBox(); self.bpm_spin.setRange(30, 300); self.bpm_spin.setValue(self.bpm); loop_h.addWidget(self.bpm_spin)
-        self.countin_cb = QCheckBox("Count-in (4)"); self.countin_cb.setChecked(True); loop_h.addWidget(self.countin_cb)
+        loop_h.addWidget(QLabel("Tick count:"))
+        self.tick_count_spin = QSpinBox(); self.tick_count_spin.setRange(1, 16); self.tick_count_spin.setValue(self.tick_count); loop_h.addWidget(self.tick_count_spin)
+        self.countin_cb = QCheckBox("Count-in"); self.countin_cb.setChecked(True); loop_h.addWidget(self.countin_cb)
         loop_h.addWidget(QLabel("Tick sound:"))
         self.tick_label = QLineEdit(); self.tick_label.setReadOnly(True); loop_h.addWidget(self.tick_label, 2)
         self.tick_browse = QPushButton("Browse"); loop_h.addWidget(self.tick_browse)
+        loop_h.addWidget(QLabel("Tick vol:"))
+        self.tick_vol_spin = QSpinBox(); self.tick_vol_spin.setRange(0, 200); self.tick_vol_spin.setValue(self.tick_volume); loop_h.addWidget(self.tick_vol_spin)
         v.addLayout(loop_h)
 
         # tracks area
@@ -490,8 +579,10 @@ class MainWindow(QMainWindow):
         self.play_btn.clicked.connect(self.on_play)
         self.pause_btn.clicked.connect(self.on_pause)
         self.stop_btn.clicked.connect(self.on_stop)
-        self.pitch_slider.valueChanged.connect(self.on_pitch_changed)
+        self.pitch_engine_combo.currentIndexChanged.connect(self.on_pitch_engine_changed)
+        self.global_pitch_combo.currentIndexChanged.connect(self.on_global_pitch_changed)
         self.loop_save_btn.clicked.connect(self.on_save_loop)
+        self.loop_delete_btn.clicked.connect(self.on_delete_loop)
         self.loop_select.currentIndexChanged.connect(self.on_loop_selected)
         self.timeline.seekRequested.connect(self.on_seek_requested)
         self.timeline.loopChanged.connect(self.on_loop_changed)
@@ -499,8 +590,10 @@ class MainWindow(QMainWindow):
         self.bpm_spin.valueChanged.connect(self.on_bpm_changed)
         self.tick_browse.clicked.connect(self.on_browse_tick)
         self.countin_cb.toggled.connect(self.on_countin_toggled)
+        self.tick_vol_spin.valueChanged.connect(self.on_tick_vol_changed)
+        self.tick_count_spin.valueChanged.connect(self.on_tick_count_changed)
 
-        # ui timer
+        # UI timer
         self.ui_timer = QTimer(); self.ui_timer.setInterval(100); self.ui_timer.timeout.connect(self.ui_tick); self.ui_timer.start()
 
     # ---------------------------
@@ -520,25 +613,29 @@ class MainWindow(QMainWindow):
                 self.settings = {}
         else:
             self.settings = {}
-        # load bpm and tick from settings if present
+        # load globals
         g = self.settings.get('_global', {})
-        self.bpm = g.get('bpm', self.bpm)
-        self.bpm_spin.setValue(self.bpm)
+        self.bpm = g.get('bpm', self.bpm); self.bpm_spin.setValue(self.bpm)
         self.tick_file = g.get('tick_file', self.tick_file)
         if self.tick_file:
-            self.tick_label.setText(self.tick_file)
-            self.tick_player.set_tick_file(self.tick_file)
-        self.countin_enabled = g.get('countin_enabled', self.countin_enabled)
-        self.countin_cb.setChecked(self.countin_enabled)
+            self.tick_label.setText(self.tick_file); self.tick_player.set_tick_file(self.tick_file)
+        self.tick_volume = g.get('tick_volume', self.tick_volume); self.tick_vol_spin.setValue(self.tick_volume)
+        self.tick_player.set_tick_volume(self.tick_volume)
+        self.countin_enabled = g.get('countin_enabled', self.countin_enabled); self.countin_cb.setChecked(self.countin_enabled)
+        self.tick_count = g.get('tick_count', self.tick_count); self.tick_count_spin.setValue(self.tick_count)
+        self.global_pitch_semitones = g.get('global_pitch', self.global_pitch_semitones)
+        idx = self.global_pitch_combo.findData(self.global_pitch_semitones)
+        if idx != -1: self.global_pitch_combo.setCurrentIndex(idx)
+        self.global_pitch_engine = g.get('pitch_engine', self.global_pitch_engine)
+        idx2 = self.pitch_engine_combo.findData(self.global_pitch_engine)
+        if idx2 != -1: self.pitch_engine_combo.setCurrentIndex(idx2)
+        # load tracks
         self.load_tracks(folder)
 
     def load_tracks(self, folder):
         for r in self.track_rows:
-            try:
-                r.player.stop()
-                r.deleteLater()
-            except Exception:
-                pass
+            try: r.player.stop(); r.deleteLater()
+            except Exception: pass
         self.track_rows = []; self.global_players = []
         self.sinks = list_pactl_sinks()
         files = [p for p in sorted(Path(folder).iterdir()) if p.suffix.lower() in AUDIO_EXTS]
@@ -550,13 +647,10 @@ class MainWindow(QMainWindow):
             row = TrackRow(str(p), self.sinks, assigned_sink=assigned, settings=self.settings)
             self.tracks_layout.addWidget(row); self.track_rows.append(row); self.global_players.append(row.player)
         self.tracks_layout.addStretch(1)
-        global_settings = self.settings.get('_global', {})
-        if global_settings:
-            self.global_pitch = global_settings.get('pitch', 1.0)
-            self.pitch_slider.setValue(int(self.global_pitch * 100))
-            loops = global_settings.get('loops', [])
-            if loops:
-                self.loop_list = loops; self.update_loop_dropdown()
+        g = self.settings.get('_global', {})
+        loops = g.get('loops', {})
+        if loops:
+            self.loop_list = loops; self.update_loop_dropdown()
         if self.global_players:
             dur = self.global_players[0].get_duration()
             if dur and dur > 0: self.timeline.set_duration(dur)
@@ -571,7 +665,7 @@ class MainWindow(QMainWindow):
                 if idx != -1: row.sink_combo.setCurrentIndex(idx)
 
     # ---------------------------
-    # Mute / Solo / Volume logic
+    # Mute/Solo/Volume
     # ---------------------------
     def apply_mute_solo_logic(self):
         solos = [r for r in self.track_rows if r.solo_cb.isChecked()]
@@ -609,13 +703,14 @@ class MainWindow(QMainWindow):
         for row in self.track_rows:
             data[Path(row.filename).name] = row.save_settings()
         data['_global'] = {
-            'pitch': self.global_pitch,
             'loops': self.loop_list,
-            'timeline_loop_start': self.timeline.loop_start,
-            'timeline_loop_end': self.timeline.loop_end,
-            'bpm': int(self.bpm),
+            'bpm': int(self.bpm_spin.value()),
             'tick_file': self.tick_file,
-            'countin_enabled': bool(self.countin_cb.isChecked())
+            'tick_volume': int(self.tick_vol_spin.value()),
+            'countin_enabled': bool(self.countin_cb.isChecked()),
+            'tick_count': int(self.tick_count_spin.value()),
+            'pitch_engine': self.global_pitch_engine,
+            'global_pitch': int(self.global_pitch_semitones)
         }
         settings_path = Path(folder) / SETTINGS_NAME
         try:
@@ -623,62 +718,101 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save settings: {e}")
 
+    def update_loop_dropdown(self):
+        self.loop_select.blockSignals(True)
+        self.loop_select.clear()
+        self.loop_select.addItem("Select loop...", None)
+        for name, rng in self.loop_list.items():
+            self.loop_select.addItem(name, (name, rng))
+        self.loop_select.blockSignals(False)
+
     # ---------------------------
-    # Transport & Count-in
+    # Loop save/overwrite/delete
+    # ---------------------------
+    def on_save_loop(self):
+        name, ok = QInputDialog.getText(self, "Save loop", "Loop name:")
+        if not ok or not name:
+            return
+        start, end = float(self.timeline.loop_start), float(self.timeline.loop_end)
+        self.loop_list[name] = [start, end]  # overwrite if exists
+        self.update_loop_dropdown()
+
+    def on_delete_loop(self):
+        cur = self.loop_select.currentData()
+        if not cur:
+            QMessageBox.information(self, "Info", "No loop selected to delete"); return
+        name, rng = cur
+        if name in self.loop_list:
+            del self.loop_list[name]
+        self.update_loop_dropdown()
+
+    def on_loop_selected(self, idx):
+        data = self.loop_select.currentData()
+        if not data:
+            return
+        name, rng = data
+        self.timeline.set_loop(rng[0], rng[1])
+
+    def on_loop_toggled(self, state):
+        if state:
+            if self.global_players:
+                start = self.timeline.loop_start
+                for p in self.global_players:
+                    try: p.seek(start)
+                    except Exception: pass
+                self.timeline.set_position(start)
+
+    def on_loop_changed(self, s, e):
+        pass
+
+    # ---------------------------
+    # Playback & Count-in (tick thread)
     # ---------------------------
     def on_play(self):
         if not self.global_players:
             return
-        # prepare start position
         start = 0.0
         if self.loop_toggle.isChecked():
             start = self.timeline.loop_start
-        speed = self.global_pitch
-        # set sinks and initial volumes
+        # prepare sinks, volumes, and apply global pitch af (realtime)
         for r in self.track_rows:
             try:
                 r.player.set_sink(r.sink_combo.currentData())
                 pv = slider_to_mpv_volume_linear(r.current_volume_slider_value)
                 r.player.set_volume(pv)
+                # apply global pitch realtime (af)
+                r.player.apply_pitch_af(self.global_pitch_semitones, self.global_pitch_engine)
             except Exception:
                 pass
         if self.countin_cb.isChecked():
-            self.start_with_countin(start, speed)
+            # run ticks in background thread to not block GUI
+            t = threading.Thread(target=self._run_countin_and_start, args=(start,), daemon=True)
+            t.start()
         else:
-            # immediate play
             for p in self.global_players:
-                try:
-                    p.play(start_pos=start, speed=speed)
-                except Exception:
-                    pass
+                try: p.play(start_pos=start, speed=self.global_playback_rate)
+                except Exception: pass
             self.apply_mute_solo_logic()
 
-    def start_with_countin(self, start_pos, speed):
-        # 4 ticks, interval based on BPM; after last tick start playback at start_pos
-        bpm = int(self.bpm_spin.value())
-        if bpm <= 0: bpm = DEFAULT_BPM
-        interval_ms = int(60000.0 / bpm)  # quarter-note interval
-        ticks = 4
-        self._countin_tick_index = 0
-        def tick_once():
-            # play tick
+    def _run_countin_and_start(self, start_pos: float):
+        bpm = int(self.bpm_spin.value()) or DEFAULT_BPM
+        interval = 60.0 / bpm
+        ticks = int(self.tick_count_spin.value()) or 4
+        # play ticks spaced by interval, then start playback
+        for i in range(ticks):
             try:
                 self.tick_player.play_tick()
             except Exception:
                 pass
-            self._countin_tick_index += 1
-            if self._countin_tick_index >= ticks:
-                # start playback
-                for p in self.global_players:
-                    try:
-                        p.play(start_pos=start_pos, speed=speed)
-                    except Exception:
-                        pass
-                self.apply_mute_solo_logic()
-            else:
-                QTimer.singleShot(interval_ms, tick_once)
-        # initial tick immediately
-        tick_once()
+            time.sleep(interval)
+        # after ticks finish, start all players
+        for p in self.global_players:
+            try: p.play(start_pos=start_pos, speed=self.global_playback_rate)
+            except Exception: pass
+        # ensure mute/solo applied
+        time.sleep(0.01)
+        # apply mute/solo from main thread via QTimer.singleShot
+        QTimer.singleShot(0, self.apply_mute_solo_logic)
 
     def on_pause(self):
         for p in self.global_players:
@@ -690,81 +824,50 @@ class MainWindow(QMainWindow):
             try: p.stop()
             except Exception: pass
 
-    def on_pitch_changed(self, val):
-        speed = float(val) / 100.0
-        self.pitch_label.setText(f"{speed:.2f}x"); self.global_pitch = speed
-        for p in self.global_players:
+    def on_pitch_engine_changed(self, idx):
+        eng = self.pitch_engine_combo.currentData()
+        if eng:
+            self.global_pitch_engine = eng
+        # re-apply AF to all players
+        for r in self.track_rows:
             try:
-                ok = p.set_pitch_filter(speed)
-                if not ok and p.player:
-                    try: p.player.speed = speed
-                    except Exception: pass
-            except Exception: pass
+                r.player.apply_pitch_af(self.global_pitch_semitones, self.global_pitch_engine)
+            except Exception:
+                pass
 
-    # ---------------------------
-    # Loop handling & timeline
-    # ---------------------------
-    def on_save_loop(self):
-        name, ok = QInputDialog.getText(self, "Save loop", "Loop name:")
-        if not ok or not name: return
-        start, end = self.timeline.loop_start, self.timeline.loop_end
-        entry = {'name': name, 'start': start, 'end': end}
-        self.loop_list.append(entry); self.update_loop_dropdown()
+    def on_global_pitch_changed(self, idx):
+        val = int(self.global_pitch_combo.currentData())
+        self.global_pitch_semitones = val
+        # apply to all players realtime
+        for r in self.track_rows:
+            try:
+                r.player.apply_pitch_af(self.global_pitch_semitones, self.global_pitch_engine)
+            except Exception:
+                pass
 
-    def update_loop_dropdown(self):
-        self.loop_select.blockSignals(True); self.loop_select.clear(); self.loop_select.addItem("Select loop...", None)
-        for l in self.loop_list: self.loop_select.addItem(l['name'], l)
-        self.loop_select.blockSignals(False)
-
-    def on_loop_selected(self, idx):
-        data = self.loop_select.currentData()
-        if not data: return
-        self.timeline.set_loop(data['start'], data['end'])
-
-    def on_loop_toggled(self, state):
-        # when toggling loop ON, jump to loop start immediately
-        if state:
-            if self.global_players:
-                start = self.timeline.loop_start
-                for p in self.global_players:
-                    try: p.seek(start)
-                    except Exception: pass
-                self.timeline.set_position(start)
-
-    def on_seek_requested(self, seconds):
-        for p in self.global_players:
-            try: p.seek(seconds)
-            except Exception: pass
-
-    def on_loop_changed(self, s, e):
-        pass
-
-    # ---------------------------
-    # BPM / Tick controls
-    # ---------------------------
     def on_bpm_changed(self, val):
-        try:
-            self.bpm = int(val)
-        except Exception:
-            self.bpm = DEFAULT_BPM
+        try: self.bpm = int(val)
+        except Exception: self.bpm = DEFAULT_BPM
 
     def on_browse_tick(self):
-        f = QFileDialog.getOpenFileName(self, "Select tick sound", str(Path.home()), "Audio files (*.wav *.mp3 *.flac *.ogg)")[0]
-        if not f:
-            return
-        self.tick_file = f
-        self.tick_label.setText(f)
-        self.tick_player.set_tick_file(f)
+        f = QFileDialog.getOpenFileName(self, "Select tick sound", str(Path.home()), "Audio files (*.wav *.ogg *.mp3 *.flac)")[0]
+        if not f: return
+        self.tick_file = f; self.tick_label.setText(f); self.tick_player.set_tick_file(f)
 
     def on_countin_toggled(self, state):
         self.countin_enabled = bool(state)
+
+    def on_tick_vol_changed(self, val):
+        self.tick_volume = int(val); self.tick_player.set_tick_volume(self.tick_volume)
+
+    def on_tick_count_changed(self, val):
+        self.tick_count = int(val)
 
     # ---------------------------
     # UI tick
     # ---------------------------
     def ui_tick(self):
-        if not self.global_players:
-            return
+        if not self.global_players: return
         pos = self.global_players[0].get_time_pos()
         self.timeline.set_position(pos)
         if self.loop_toggle.isChecked():
@@ -783,12 +886,11 @@ class MainWindow(QMainWindow):
             except Exception: pass
 
     # ---------------------------
-    # Closing: save config
+    # Close & save
     # ---------------------------
     def closeEvent(self, event):
         try:
             if self.current_folder:
-                # save bpm/tick/countin into _global
                 self.save_config(self.current_folder)
         except Exception:
             pass
@@ -796,6 +898,7 @@ class MainWindow(QMainWindow):
             try: r.player.stop()
             except Exception: pass
         super().closeEvent(event)
+
 
 # ---------------------------
 # main entry
@@ -807,6 +910,7 @@ def main():
     mw = MainWindow()
     mw.show()
     sys.exit(app.exec())
+
 
 if __name__ == '__main__':
     main()
