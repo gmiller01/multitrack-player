@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-# multitrack_player_v12.py
-# Multitrack Player v12 - PyQt6
-# - DEFAULT_BPM = 80
-# - Playback rate +/- buttons (±5% step, 0.5x - 1.5x)
-# - Loop autoload: last_used_loop -> first loop -> full-track default
-# - last_used_loop saved to JSON
-# - Loop visual highlight: faint background
+# multitrack_player_v13.py
+# Multitrack Player v13 - PyQt6
+# - Progress + loop synced to actual audio position
+# - Playback rate +/- buttons (±5% step)
+# - Loop pulsing effect when active
+# - last_used_loop autoload logic
 # - LC_NUMERIC fix included
 
 import os
 import locale
 
-# Ensure C numeric locale for libmpv (prevents Non-C locale segfaults)
+# LC_NUMERIC fix for libmpv locale issues
 locale.setlocale(locale.LC_NUMERIC, "C")
 os.environ["LC_NUMERIC"] = "C"
 
@@ -22,6 +21,7 @@ import threading
 import subprocess
 from pathlib import Path
 from typing import Optional, Dict
+from math import sin, pi
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout,
@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPen
 
-# optional libs
+# Optional libs
 try:
     import pygame
     PYGAME_AVAILABLE = True
@@ -300,7 +300,7 @@ class TickPlayer:
             return False
 
 # ---------------------------
-# Timeline widget (with faint loop background)
+# Timeline widget with pulsing loop highlight
 # ---------------------------
 class Timeline(QWidget):
     seekRequested = pyqtSignal(float)
@@ -313,7 +313,9 @@ class Timeline(QWidget):
         self.loop_start = 0.0
         self.loop_end = self.duration
         self.dragging = None
-        self.setMinimumHeight(48)
+        self.pulse_phase = 0.0  # radians
+        self.pulse_speed = 2 * pi / 2.0  # 2s period by default
+        self.setMinimumHeight(56)
         self.setMouseTracking(True)
 
     def set_duration(self, d):
@@ -331,13 +333,18 @@ class Timeline(QWidget):
         self.loop_end = max(self.loop_start, min(end, self.duration))
         self.update()
 
+    def advance_pulse(self, dt_seconds):
+        self.pulse_phase += self.pulse_speed * dt_seconds
+        # keep it in reasonable range
+        if self.pulse_phase > 1e6:
+            self.pulse_phase %= (2 * pi)
+
     def paintEvent(self, event):
         p = QPainter(self)
         rect = self.rect()
         w = float(rect.width()); h = float(rect.height())
-        # background
         p.fillRect(rect, QColor("#3a3a3a"))
-        bar_h = 12.0
+        bar_h = 14.0
         bar_y = float(h / 2.0 - bar_h / 2.0)
         bar_rect = QRectF(10.0, bar_y, max(10.0, w - 20.0), bar_h)
         p.setBrush(QColor("#2f2f2f"))
@@ -347,15 +354,21 @@ class Timeline(QWidget):
         def x_for(t):
             return 10.0 + (w - 20.0) * (t / max(1.0, self.duration))
 
-        # loop area: faint background
+        # loop area: faint background; if playback is inside loop, apply pulsing alpha
         lsx = x_for(self.loop_start)
         lex = x_for(self.loop_end)
+        base_alpha = 80
+        pulse_alpha = int(base_alpha + 40 * (0.5 + 0.5 * sin(self.pulse_phase)))  # 40 amplitude around base
+        loop_alpha = base_alpha
+        # If current position is inside loop, make it pulse stronger
+        if self.loop_start <= self.position <= self.loop_end:
+            loop_alpha = pulse_alpha
         loop_rect = QRectF(lsx, bar_y, max(4.0, lex - lsx), bar_h)
-        p.setBrush(QColor(80, 160, 200, 90))  # faint (alpha)
+        p.setBrush(QColor(80, 160, 200, loop_alpha))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(loop_rect)
 
-        # progress
+        # progress bar
         posx = x_for(self.position)
         prog_rect = QRectF(10.0, bar_y, max(2.0, posx - 10.0), bar_h)
         p.setBrush(QColor("#66bb6a"))
@@ -388,6 +401,7 @@ class Timeline(QWidget):
         def t_from_x(xv): return (xv - 10.0) / max(1.0, (w - 20.0)) * self.duration
         lsx = 10.0 + (w - 20.0) * (self.loop_start / max(1.0, self.duration))
         lex = 10.0 + (w - 20.0) * (self.loop_end / max(1.0, self.duration))
+        # detect handle hits
         if abs(x - lsx) < 12.0:
             self.dragging = 'start'; return
         if abs(x - lex) < 12.0:
@@ -519,7 +533,7 @@ class TrackRow(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Multitrack Player v12 - PyQt6")
+        self.setWindowTitle("Multitrack Player v13 - PyQt6")
         self.resize(1220, 860)
         self.setStyleSheet("""
             QWidget { background-color: #2f2f2f; color: #e6e6e6; }
@@ -630,7 +644,9 @@ class MainWindow(QMainWindow):
         self.tick_count_spin.valueChanged.connect(self.on_tick_count_changed)
 
         # UI timer
-        self.ui_timer = QTimer(); self.ui_timer.setInterval(100); self.ui_timer.timeout.connect(self.ui_tick); self.ui_timer.start()
+        self.ui_timer = QTimer(); self.ui_timer.setInterval(80)  # ~12.5 FPS UI update
+        self._last_ui_time = time.time()
+        self.ui_timer.timeout.connect(self.ui_tick); self.ui_timer.start()
 
     # ---------------------------
     # File & tracks
@@ -665,7 +681,6 @@ class MainWindow(QMainWindow):
         self.global_pitch_engine = g.get('pitch_engine', self.global_pitch_engine)
         idx2 = self.pitch_engine_combo.findData(self.global_pitch_engine)
         if idx2 != -1: self.pitch_engine_combo.setCurrentIndex(idx2)
-        # playback rate load (optional)
         self.global_playback_rate = g.get('playback_rate', self.global_playback_rate)
         self._update_playback_rate_label()
         # load tracks
@@ -705,12 +720,11 @@ class MainWindow(QMainWindow):
         loops = g.get('loops', {})
         self.loop_list = loops if loops else {}
         self.update_loop_dropdown()
-        # autoselect logic
+        # autoselect logic: last_used_loop -> first -> full track
         last = g.get('last_used_loop')
         if last and last in self.loop_list:
             chosen = last
         elif self.loop_list:
-            # choose the first key
             chosen = next(iter(self.loop_list.keys()))
         else:
             chosen = None
@@ -718,14 +732,20 @@ class MainWindow(QMainWindow):
             rng = self.loop_list[chosen]
             self.current_loop_name = chosen
             self.timeline.set_loop(rng[0], rng[1])
-            # set combobox to chosen
             idx = self.loop_select.findText(chosen)
             if idx != -1:
                 self.loop_select.setCurrentIndex(idx)
         else:
-            # no saved loops -> full track
             self.current_loop_name = None
             self.timeline.set_loop(0.0, maxdur)
+
+        # ensure players reflect playback rate immediately (if needed)
+        for p in self.global_players:
+            try:
+                if p.player:
+                    p.player.speed = self.global_playback_rate
+            except Exception:
+                pass
 
     def on_refresh(self):
         self.sinks = list_pactl_sinks()
@@ -812,10 +832,13 @@ class MainWindow(QMainWindow):
         # mark as last used
         self.current_loop_name = name
         self.update_loop_dropdown()
-        # set combobox to this loop
         idx = self.loop_select.findText(name)
         if idx != -1:
             self.loop_select.setCurrentIndex(idx)
+        # update stored settings in memory
+        if '_global' not in self.settings:
+            self.settings['_global'] = {}
+        self.settings['_global']['last_used_loop'] = name
 
     def on_delete_loop(self):
         cur = self.loop_select.currentData()
@@ -824,7 +847,6 @@ class MainWindow(QMainWindow):
         name, rng = cur
         if name in self.loop_list:
             del self.loop_list[name]
-        # if deleted was current, reset current_loop_name and choose fallback
         if self.current_loop_name == name:
             self.current_loop_name = None
         self.update_loop_dropdown()
@@ -836,7 +858,7 @@ class MainWindow(QMainWindow):
         name, rng = data
         self.current_loop_name = name
         self.timeline.set_loop(rng[0], rng[1])
-        # save last used immediately into settings dict (not file) so UI persists
+        # save last used immediately in memory
         if '_global' not in self.settings:
             self.settings['_global'] = {}
         self.settings['_global']['last_used_loop'] = name
@@ -851,9 +873,9 @@ class MainWindow(QMainWindow):
                 self.timeline.set_position(start)
 
     def on_loop_changed(self, s, e):
-        # if user manually changed loop using handles, consider it active (no name)
-        # we do not auto-create a name here
-        pass
+        # user manually adjusted loop handles (no automatic naming)
+        # keep current_loop_name None (until saved)
+        self.current_loop_name = None
 
     # ---------------------------
     # Playback & Count-in
@@ -871,6 +893,13 @@ class MainWindow(QMainWindow):
                 pv = float(r.current_volume_slider_value)
                 r.player.set_volume(pv)
                 r.player.apply_pitch_af(self.global_pitch_semitones, self.global_pitch_engine)
+            except Exception:
+                pass
+        # ensure players have current playback rate
+        for p in self.global_players:
+            try:
+                if p.player:
+                    p.player.speed = self.global_playback_rate
             except Exception:
                 pass
         if self.countin_cb.isChecked():
@@ -927,6 +956,10 @@ class MainWindow(QMainWindow):
                     p.player.speed = self.global_playback_rate
             except Exception:
                 pass
+        # persist to settings in memory
+        if '_global' not in self.settings:
+            self.settings['_global'] = {}
+        self.settings['_global']['playback_rate'] = float(self.global_playback_rate)
         self._update_playback_rate_label()
 
     def on_rate_minus(self):
@@ -940,6 +973,9 @@ class MainWindow(QMainWindow):
                     p.player.speed = self.global_playback_rate
             except Exception:
                 pass
+        if '_global' not in self.settings:
+            self.settings['_global'] = {}
+        self.settings['_global']['playback_rate'] = float(self.global_playback_rate)
         self._update_playback_rate_label()
 
     def on_pitch_engine_changed(self, idx):
@@ -983,20 +1019,50 @@ class MainWindow(QMainWindow):
         self.tick_count = int(val)
 
     # ---------------------------
-    # UI tick
+    # UI tick (synchronized to actual audio time)
     # ---------------------------
     def ui_tick(self):
-        if not self.global_players: return
-        pos = self.global_players[0].get_time_pos()
+        now = time.time()
+        dt = now - self._last_ui_time if hasattr(self, '_last_ui_time') else 0.08
+        self._last_ui_time = now
+
+        # Advance timeline's pulse phase for visual pulsing
+        self.timeline.advance_pulse(dt)
+
+        if not self.global_players:
+            return
+
+        # Use the primary player's reported time_pos as source of truth
+        try:
+            pos = self.global_players[0].get_time_pos()
+        except Exception:
+            pos = 0.0
+
+        # Update timeline position directly from player time_pos (seconds)
         self.timeline.set_position(pos)
+
+        # Loop handling: if looping enabled and we've passed loop end, seek to loop start
         if self.loop_toggle.isChecked():
             start, end = self.timeline.loop_start, self.timeline.loop_end
+            # small epsilon for safety
             if pos >= end - 0.02:
                 for p in self.global_players:
-                    try: p.seek(start)
-                    except Exception: pass
-        dur = self.global_players[0].get_duration()
-        if dur and dur > 0: self.timeline.set_duration(dur)
+                    try:
+                        p.seek(start)
+                    except Exception:
+                        pass
+                # update timeline position so UI immediately reflects the seek
+                self.timeline.set_position(start)
+
+        # Ensure duration stays accurate if mpv reports it
+        try:
+            dur = self.global_players[0].get_duration()
+            if dur and dur > 0:
+                self.timeline.set_duration(dur)
+        except Exception:
+            pass
+
+        # Apply mute/solo after any tempo/seek adjustments
         self.apply_mute_solo_logic()
 
     def on_seek_requested(self, seconds):
