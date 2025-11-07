@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-# multitrack_player_v14.py
-# Multitrack Player v14 - PyQt6
-# - Global config at ~/.config/multitrack_player/config.json
-# - Tick file stored globally
-# - Output selection applied to mpv audio-device property
-# - Progress + loop pulsing visuals
-# - Playback rate +/- (±5%), loop autoload last_used_loop -> first -> full-track
+# multitrack_player_v15.py
+# Multitrack Player v15 - PyQt6 + sounddevice multi-output streaming
+# - per-track output routing using sounddevice OutputStream
+# - global tick config in ~/.config/multitrack_player/config.json
+# - pulsing loop & pulsing progress bar inside loop
+# - playback_rate applied via simple resampling (linear interp)
 
 import os
 import locale
-
-# LC_NUMERIC fix for libmpv locale issues
 locale.setlocale(locale.LC_NUMERIC, "C")
 os.environ["LC_NUMERIC"] = "C"
 
@@ -18,10 +15,13 @@ import sys
 import json
 import time
 import threading
+import tempfile
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from math import sin, pi
+
+import numpy as np
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout,
@@ -31,7 +31,19 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPen
 
-# Optional libs
+# optional libs
+try:
+    import sounddevice as sd
+    SD_AVAILABLE = True
+except Exception:
+    SD_AVAILABLE = False
+
+try:
+    import soundfile as sf
+    SF_AVAILABLE = True
+except Exception:
+    SF_AVAILABLE = False
+
 try:
     import pygame
     PYGAME_AVAILABLE = True
@@ -39,253 +51,329 @@ except Exception:
     PYGAME_AVAILABLE = False
 
 try:
-    import mpv
-except Exception:
-    mpv = None
-
-try:
     from mutagen import File as MutagenFile
     MUTAGEN_AVAILABLE = True
 except Exception:
     MUTAGEN_AVAILABLE = False
 
-# Constants & paths
-SETTINGS_NAME = "multitrack_config.json"  # per-folder settings
+# Paths & constants
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "multitrack_player"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.json"
-AUDIO_EXTS = ('.wav', '.mp3', '.flac', '.ogg', '.m4a')
+SETTINGS_NAME = "multitrack_config.json"
+AUDIO_EXTS = ('.wav', '.flac', '.ogg', '.mp3', '.m4a')
 DEFAULT_BPM = 80
 DEFAULT_TICK_VOL = 80
-PITCH_ENGINE_OPTIONS = ["rubberband", "scaletempo"]
-DEFAULT_PITCH_ENGINE = "rubberband"
 PLAYBACK_RATE_MIN = 0.5
 PLAYBACK_RATE_MAX = 1.5
-PLAYBACK_RATE_STEP = 0.05  # 5%
+PLAYBACK_RATE_STEP = 0.05
 
-# make sure global config dir exists
-try:
-    GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
+GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Helpers for global config
-def load_global_config() -> Dict:
+def load_global_config():
     if GLOBAL_CONFIG_FILE.exists():
         try:
-            with open(GLOBAL_CONFIG_FILE, "r") as f:
+            with open(GLOBAL_CONFIG_FILE, 'r') as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
-def save_global_config(cfg: Dict):
+def save_global_config(cfg):
     try:
         GLOBAL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(GLOBAL_CONFIG_FILE, "w") as f:
+        with open(GLOBAL_CONFIG_FILE, 'w') as f:
             json.dump(cfg, f, indent=2)
     except Exception as e:
-        print("Failed to save global config:", e)
+        print("Couldn't save global config:", e)
 
-# Helpers
 def list_pactl_sinks():
+    """Try to obtain sinks via pactl; return list of (index, name)."""
     try:
         out = subprocess.check_output(['pactl', 'list', 'short', 'sinks'], text=True)
+        sinks = []
+        for line in out.strip().splitlines():
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                sinks.append((parts[0], parts[1]))
+        return sinks
     except Exception:
+        # fallback: list sounddevice devices (names)
+        if SD_AVAILABLE:
+            devs = sd.query_devices()
+            sinks = []
+            for i, d in enumerate(devs):
+                # treat any output-capable device
+                if d['max_output_channels'] > 0:
+                    sinks.append((str(i), d['name']))
+            return sinks
         return []
-    sinks = []
-    for line in out.strip().splitlines():
-        parts = line.split('\t')
-        if len(parts) >= 2:
-            idx = parts[0]; name = parts[1]; desc = parts[-1]
-            sinks.append((idx, name, desc))
-    return sinks
 
-def semitone_to_scale(semitones: int) -> float:
+def semitone_to_scale(semitones):
     return 2.0 ** (float(semitones) / 12.0)
 
 def get_audio_duration(path: Path) -> float:
-    """Try mutagen -> ffprobe -> 0.0 fallback"""
-    try:
-        if MUTAGEN_AVAILABLE:
+    if MUTAGEN_AVAILABLE:
+        try:
             f = MutagenFile(str(path))
             if f and hasattr(f.info, 'length'):
                 return float(f.info.length)
-    except Exception:
-        pass
-    try:
-        out = subprocess.check_output([
-            'ffprobe', '-v', 'error', '-show_entries',
-            'format=duration', '-of',
-            'default=noprint_wrappers=1:nokey=1', str(path)
-        ], stderr=subprocess.DEVNULL, text=True)
-        if out:
-            return float(out.strip())
-    except Exception:
-        pass
-    return 0.0
-
-# ---------------------------
-# TrackPlayer wrapper (mpv)
-# ---------------------------
-class TrackPlayer:
-    def __init__(self, file_path, sink_name=None):
-        self.file_path = str(file_path)
-        self.sink_name = sink_name
-        self.player = None
-        self.is_playing = False
-        self.create_player()
-
-    def create_player(self, volume=100.0):
-        # Create mpv instance; if sink selected, pass nothing here (will set property)
-        opts = {'no_video': True, 'volume': volume, 'keep-open': True, 'msg-level': 'all=no'}
-        try:
-            self.player = mpv.MPV(**opts) if mpv else None
-        except Exception:
-            try:
-                self.player = mpv.MPV() if mpv else None
-                if self.player:
-                    try:
-                        self.player.volume = volume
-                    except Exception:
-                        pass
-            except Exception:
-                self.player = None
-        # if sink is known, set it
-        if self.player and self.sink_name:
-            try:
-                # set audio-device property. Using pulse/<name> is typical for pulseaudio/pactl.
-                self.player.set_property('audio-device', f"pulse/{self.sink_name}")
-            except Exception:
-                # some mpv builds expect just the name, or pipewire device. Try name fallback:
-                try:
-                    self.player.set_property('audio-device', self.sink_name)
-                except Exception:
-                    pass
-
-    def set_sink(self, sink_name):
-        self.sink_name = sink_name
-        if not self.player:
-            return
-        try:
-            self.player.set_property('audio-device', f"pulse/{sink_name}")
-        except Exception:
-            try:
-                self.player.set_property('audio-device', sink_name)
-            except Exception:
-                pass
-
-    def set_volume(self, vol_pct: float):
-        if self.player:
-            try:
-                self.player.set_property('volume', float(vol_pct))
-            except Exception:
-                try:
-                    self.player.volume = float(vol_pct)
-                except Exception:
-                    pass
-
-    def apply_pitch_af(self, semitones: int, engine: str):
-        if not self.player:
-            return False
-        scale = semitone_to_scale(int(semitones))
-        if engine == "rubberband":
-            af = f"rubberband=pitch-scale={scale},tempo-scale=1.0"
-        else:
-            af = f"asetrate=48000*{scale},scaletempo,aresample=48000"
-        try:
-            try:
-                self.player.command('af', 'clear')
-            except Exception:
-                pass
-            try:
-                self.player.command('af', 'add', af)
-                return True
-            except Exception:
-                try:
-                    self.player.set_property('af', af)
-                    return True
-                except Exception:
-                    return False
-        except Exception:
-            return False
-
-    def play(self, start_pos: float = 0.0, speed: float = 1.0):
-        if not self.player:
-            self.create_player()
-        try:
-            self.player.play(self.file_path)
-            if start_pos and start_pos > 0.0:
-                time.sleep(0.02)
-                try:
-                    self.player.seek(start_pos, reference='absolute')
-                except Exception:
-                    pass
-            try:
-                self.player.speed = speed
-            except Exception:
-                pass
-            self.is_playing = True
-        except Exception as e:
-            print("Play error:", e)
-            self.is_playing = False
-
-    def stop(self):
-        if self.player:
-            try:
-                self.player.stop()
-            except Exception:
-                pass
-        self.is_playing = False
-
-    def pause(self):
-        if self.player:
-            try:
-                self.player.pause = True
-            except Exception:
-                pass
-        self.is_playing = False
-
-    def resume(self):
-        if self.player:
-            try:
-                self.player.pause = False
-            except Exception:
-                pass
-        self.is_playing = True
-
-    def get_time_pos(self) -> float:
-        if not self.player:
-            return 0.0
-        try:
-            pos = self.player.time_pos
-            return float(pos) if pos else 0.0
-        except Exception:
-            return 0.0
-
-    def seek(self, seconds: float):
-        if not self.player:
-            return
-        try:
-            self.player.seek(seconds, reference='absolute')
         except Exception:
             pass
-
-    def get_duration(self) -> float:
-        if self.player:
-            try:
-                d = self.player.duration
-                return float(d) if d else 0.0
-            except Exception:
-                pass
+    # ffprobe fallback
+    try:
+        out = subprocess.check_output([
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', str(path)
+        ], stderr=subprocess.DEVNULL, text=True)
+        return float(out.strip())
+    except Exception:
         return 0.0
 
 # ---------------------------
-# Tick player (pygame)
+# Audio helpers: decoding & streaming
+# ---------------------------
+def decode_with_ffmpeg_to_wav(src_path: Path, dest_path: Path):
+    """Use ffmpeg to decode src to WAV (16-bit PCM) into dest_path."""
+    cmd = [
+        "ffmpeg", "-y", "-v", "error", "-i", str(src_path),
+        "-ar", "48000", "-ac", "2", "-f", "wav", str(dest_path)
+    ]
+    subprocess.check_call(cmd)
+
+def open_soundfile_with_fallback(path: Path):
+    """Try opening with soundfile. If fails (e.g. mp3), decode via ffmpeg to temp wav and open that."""
+    if not SF_AVAILABLE:
+        raise RuntimeError("soundfile (pysoundfile) is required for sounddevice playback.")
+    try:
+        sf_obj = sf.SoundFile(str(path))
+        return sf_obj, None
+    except Exception:
+        # try ffmpeg fallback
+        tmp = tempfile.NamedTemporaryFile(prefix="mtp_dec_", suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            decode_with_ffmpeg_to_wav(path, Path(tmp.name))
+            sf_obj = sf.SoundFile(tmp.name)
+            return sf_obj, tmp.name
+        except Exception as e:
+            # cleanup
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+            raise e
+
+# ---------------------------
+# TrackPlayer using sounddevice
+# ---------------------------
+class TrackPlayerSD:
+    """Stream audio file to selected device via sounddevice OutputStream.
+       Supports simple playback_rate by resampling blocks (linear interp)."""
+    def __init__(self, path: Path, device_index: Optional[int] = None):
+        self.path = Path(path)
+        self.device_index = device_index
+        self.sf = None
+        self._temp_wav = None
+        self.stream = None
+        self.lock = threading.Lock()
+        self.playing = False
+        self.position = 0.0  # seconds
+        self.duration = 0.0
+        self.playback_rate = 1.0
+        self.blocksize = 4096
+        self.channels = 2
+        self.samplerate = 48000
+        self.stop_flag = threading.Event()
+        self._open_file()
+
+    def _open_file(self):
+        if not SF_AVAILABLE:
+            raise RuntimeError("soundfile not installed")
+        sf_obj = None
+        tmp_path = None
+        try:
+            sf_obj, tmp = open_soundfile_with_fallback(self.path)
+            self.sf = sf_obj
+            self._temp_wav = tmp
+            self.channels = self.sf.channels
+            self.samplerate = int(self.sf.samplerate)
+            # Duration
+            try:
+                self.duration = float(len(self.sf) / self.sf.samplerate)
+            except Exception:
+                # fallback using get_audio_duration
+                self.duration = get_audio_duration(self.path)
+        except Exception as e:
+            raise RuntimeError(f"Unable to open audio file {self.path}: {e}")
+
+    def set_device(self, device_index: Optional[int]):
+        """Set sounddevice device index (int) or None for default."""
+        self.device_index = device_index
+        # If a stream is running, restart it to apply device change
+        if self.playing:
+            self.stop()
+            time.sleep(0.02)
+            self.play(start_pos=self.position)
+
+    def set_playback_rate(self, rate: float):
+        with self.lock:
+            self.playback_rate = rate
+
+    def set_volume_db(self, vol_pct: float):
+        # simple: map 0..120 to linear gain (0..1.2). More advanced mapping optional.
+        self.volume = max(0.0, float(vol_pct) / 100.0)
+
+    def play(self, start_pos: float = 0.0):
+        if not SD_AVAILABLE or not SF_AVAILABLE:
+            raise RuntimeError("sounddevice and soundfile required")
+        with self.lock:
+            self.stop_flag.clear()
+            self.playing = True
+            self.sf.seek(int(start_pos * self.sf.samplerate))
+            self.position = start_pos
+            # create stream
+            target_sr = self.sf.samplerate
+            channels = self.sf.channels
+            dev = int(self.device_index) if (self.device_index is not None and str(self.device_index).isdigit()) else None
+            try:
+                self.stream = sd.OutputStream(
+                    samplerate=target_sr,
+                    blocksize=self.blocksize,
+                    device=dev,
+                    channels=channels,
+                    dtype='float32',
+                    callback=self._callback,
+                    finished_callback=self._stream_finished
+                )
+                self.stream.start()
+            except Exception as e:
+                # Try with default device without device argument
+                try:
+                    self.stream = sd.OutputStream(
+                        samplerate=target_sr,
+                        blocksize=self.blocksize,
+                        channels=channels,
+                        dtype='float32',
+                        callback=self._callback,
+                        finished_callback=self._stream_finished
+                    )
+                    self.stream.start()
+                except Exception as e2:
+                    print("Failed to start OutputStream:", e, e2)
+                    self.playing = False
+
+    def _stream_finished(self):
+        self.playing = False
+
+    def _callback(self, outdata, frames, time_info, status):
+        """sounddevice callback: fill outdata (frames x channels) with audio (float32)."""
+        if self.stop_flag.is_set():
+            outdata[:] = np.zeros((frames, self.sf.channels), dtype='float32')
+            raise sd.CallbackStop()
+        # Read enough frames from file considering playback_rate
+        with self.lock:
+            rate = float(self.playback_rate)
+            vol = getattr(self, 'volume', 1.0)
+        # Calculate how many source frames we need to produce 'frames' output frames after resampling
+        # source_frames_needed = ceil(frames * (1 / rate))
+        src_frames_needed = int(np.ceil(frames / rate)) + 2
+        try:
+            src = self.sf.read(frames=src_frames_needed, dtype='float32', always_2d=True)
+            if src.size == 0:
+                # EOF -> stop
+                outdata[:] = np.zeros((frames, self.sf.channels), dtype='float32')
+                raise sd.CallbackStop()
+            # perform linear resampling from src to frames
+            src_len = src.shape[0]
+            if rate == 1.0:
+                # direct copy (may have fewer frames)
+                if src_len >= frames:
+                    out = src[:frames]
+                else:
+                    # pad zeros
+                    out = np.zeros((frames, src.shape[1]), dtype='float32')
+                    out[:src_len] = src
+            else:
+                # create position indices in source corresponding to output frames
+                src_pos = np.linspace(0, max(0, src_len - 1), num=frames) * (1.0 / rate)
+                # but safer: map output frame i to source position i / rate
+                src_pos = (np.arange(frames) / rate)
+                # If src doesn't contain enough frames for desired positions, read fewer or pad
+                # We'll use numpy.interp per channel (simple linear)
+                out = np.zeros((frames, src.shape[1]), dtype='float32')
+                for ch in range(src.shape[1]):
+                    # x coords for src: 0..src_len-1
+                    xs = np.arange(src_len)
+                    ys = src[:, ch]
+                    # for positions beyond src_len-1, interp uses last value; to avoid that, pad with 0
+                    # create xp and fp with extra zero at end
+                    xp = np.concatenate([xs, [xs[-1] + 1]])
+                    fp = np.concatenate([ys, [0.0]])
+                    out[:, ch] = np.interp(src_pos, xp, fp).astype('float32')
+            # apply volume scalar
+            out *= vol
+            # update position in seconds
+            self.position += frames / float(self.sf.samplerate) * rate
+            # ensure outdata shape matches expected channels (sounddevice expects matching channels)
+            if out.shape[1] < outdata.shape[1]:
+                # pad channels
+                pad = np.zeros((frames, outdata.shape[1] - out.shape[1]), dtype='float32')
+                out = np.concatenate([out, pad], axis=1)
+            elif out.shape[1] > outdata.shape[1]:
+                out = out[:, :outdata.shape[1]]
+            outdata[:] = out
+        except sd.CallbackStop:
+            raise
+        except Exception as e:
+            print("Stream callback error:", e)
+            outdata[:] = np.zeros((frames, outdata.shape[1]), dtype='float32')
+            raise sd.CallbackStop()
+
+    def seek(self, seconds: float):
+        with self.lock:
+            pos_frames = int(seconds * self.sf.samplerate)
+            try:
+                self.sf.seek(pos_frames)
+                self.position = seconds
+            except Exception:
+                pass
+
+    def stop(self):
+        self.stop_flag.set()
+        try:
+            if self.stream:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception:
+                    pass
+        finally:
+            self.playing = False
+            # close file and temporary wav
+            try:
+                if self.sf:
+                    self.sf.close()
+            except Exception:
+                pass
+            if self._temp_wav and Path(self._temp_wav).exists():
+                try:
+                    os.unlink(self._temp_wav)
+                except Exception:
+                    pass
+
+    def get_time_pos(self):
+        return float(self.position)
+
+    def get_duration(self):
+        return float(self.duration)
+
+# ---------------------------
+# Tick player (pygame fallback)
 # ---------------------------
 class TickPlayer:
-    def __init__(self, tick_file: Optional[str] = None, tick_volume: int = DEFAULT_TICK_VOL):
-        self.tick_file = tick_file
-        self.tick_volume = int(tick_volume)
+    def __init__(self, path: Optional[str] = None, vol: int = DEFAULT_TICK_VOL):
+        self.path = path
+        self.vol = vol
         self._inited = False
         if PYGAME_AVAILABLE:
             try:
@@ -294,32 +382,24 @@ class TickPlayer:
             except Exception:
                 self._inited = False
         self.sound = None
-        if self._inited and self.tick_file and Path(self.tick_file).exists():
+        if self._inited and self.path and Path(self.path).exists():
             try:
-                self.sound = pygame.mixer.Sound(self.tick_file)
-                self.sound.set_volume(max(0.0, min(1.0, self.tick_volume / 100.0)))
+                self.sound = pygame.mixer.Sound(self.path)
+                self.sound.set_volume(self.vol / 100.0)
             except Exception:
                 self.sound = None
 
-    def set_tick_file(self, tick_file: Optional[str]):
-        self.tick_file = tick_file
+    def set_tick_file(self, path):
+        self.path = path
         if self._inited:
             try:
-                if self.tick_file and Path(self.tick_file).exists():
-                    self.sound = pygame.mixer.Sound(self.tick_file)
-                    self.sound.set_volume(max(0.0, min(1.0, self.tick_volume / 100.0)))
+                if self.path and Path(self.path).exists():
+                    self.sound = pygame.mixer.Sound(self.path)
+                    self.sound.set_volume(self.vol / 100.0)
                 else:
                     self.sound = None
             except Exception:
                 self.sound = None
-
-    def set_tick_volume(self, vol_percent: int):
-        self.tick_volume = int(vol_percent)
-        if self.sound:
-            try:
-                self.sound.set_volume(max(0.0, min(1.0, self.tick_volume / 100.0)))
-            except Exception:
-                pass
 
     def play_tick(self):
         if self._inited and self.sound:
@@ -328,9 +408,9 @@ class TickPlayer:
                 return True
             except Exception:
                 pass
-        if self.tick_file and Path(self.tick_file).exists():
+        if self.path and Path(self.path).exists():
             try:
-                subprocess.Popen(['mpv', '--no-video', '--really-quiet', f'--volume={self.tick_volume}', self.tick_file])
+                subprocess.Popen(['mpv', '--no-video', '--really-quiet', self.path])
                 return True
             except Exception:
                 pass
@@ -341,49 +421,49 @@ class TickPlayer:
             return False
 
 # ---------------------------
-# Timeline widget with pulsing loop & pulsing progress inside loop
+# Timeline widget with pulsing of loop and progress inside loop
 # ---------------------------
 class Timeline(QWidget):
     seekRequested = pyqtSignal(float)
     loopChanged = pyqtSignal(float, float)
 
-    def __init__(self, duration=1.0):
+    def __init__(self, duration=10.0):
         super().__init__()
         self.duration = max(1.0, float(duration))
         self.position = 0.0
         self.loop_start = 0.0
         self.loop_end = self.duration
         self.dragging = None
-        self.pulse_phase = 0.0  # radians
-        self.pulse_speed = 2 * pi / 2.0  # 2s period by default
-        self.setMinimumHeight(56)
+        self.pulse_phase = 0.0
+        self.pulse_speed = 2 * pi / 2.0  # 2 seconds
+        self.setMinimumHeight(60)
         self.setMouseTracking(True)
 
-    def set_duration(self, d):
+    def set_duration(self, d: float):
         self.duration = max(1.0, float(d))
         if self.loop_end > self.duration:
             self.loop_end = self.duration
         self.update()
 
-    def set_position(self, pos):
+    def set_position(self, pos: float):
         self.position = max(0.0, min(pos, self.duration))
         self.update()
 
-    def set_loop(self, start, end):
+    def set_loop(self, start: float, end: float):
         self.loop_start = max(0.0, min(start, self.duration))
         self.loop_end = max(self.loop_start, min(end, self.duration))
         self.update()
 
-    def advance_pulse(self, dt_seconds):
-        self.pulse_phase += self.pulse_speed * dt_seconds
+    def advance_pulse(self, dt):
+        self.pulse_phase += self.pulse_speed * dt
         if self.pulse_phase > 1e6:
             self.pulse_phase %= (2 * pi)
 
-    def paintEvent(self, event):
+    def paintEvent(self, ev):
         p = QPainter(self)
         rect = self.rect()
         w = float(rect.width()); h = float(rect.height())
-        p.fillRect(rect, QColor("#3a3a3a"))
+        p.fillRect(rect, QColor("#333333"))
         bar_h = 14.0
         bar_y = float(h / 2.0 - bar_h / 2.0)
         bar_rect = QRectF(10.0, bar_y, max(10.0, w - 20.0), bar_h)
@@ -394,28 +474,23 @@ class Timeline(QWidget):
         def x_for(t):
             return 10.0 + (w - 20.0) * (t / max(1.0, self.duration))
 
-        # loop area: faint background; pulsing alpha if inside
         lsx = x_for(self.loop_start)
         lex = x_for(self.loop_end)
         base_alpha = 80
-        pulse_alpha = int(base_alpha + 40 * (0.5 + 0.5 * sin(self.pulse_phase)))
+        pulse_alpha = int(base_alpha + 60 * (0.5 + 0.5 * sin(self.pulse_phase)))
         loop_alpha = base_alpha
         if self.loop_start <= self.position <= self.loop_end:
             loop_alpha = pulse_alpha
-        loop_rect = QRectF(lsx, bar_y, max(4.0, lex - lsx), bar_h)
         p.setBrush(QColor(80, 160, 200, loop_alpha))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRect(loop_rect)
+        p.drawRect(QRectF(lsx, bar_y, max(4.0, lex - lsx), bar_h))
 
-        # progress bar - if inside loop, make the progress color also pulse (use same phase)
+        # progress bar (pulser inside loop)
         posx = x_for(self.position)
         prog_rect = QRectF(10.0, bar_y, max(2.0, posx - 10.0), bar_h)
-        # progress alpha base and pulse
-        prog_base_alpha = 255
-        prog_pulse_add = int(80 * (0.5 + 0.5 * sin(self.pulse_phase))) if (self.loop_start <= self.position <= self.loop_end) else 0
-        prog_alpha = min(255, prog_base_alpha + prog_pulse_add)
-        # QColor doesn't accept alpha >255; produce color with alpha
-        col = QColor("#66bb6a")
+        prog_base_alpha = 200
+        prog_pulse = int(55 * (0.5 + 0.5 * sin(self.pulse_phase))) if (self.loop_start <= self.position <= self.loop_end) else 0
+        prog_alpha = min(255, prog_base_alpha + prog_pulse)
+        col = QColor(102, 187, 106)  # green
         col.setAlpha(prog_alpha)
         p.setBrush(col)
         p.setPen(Qt.PenStyle.NoPen)
@@ -425,15 +500,12 @@ class Timeline(QWidget):
         handle_w = 10.0; handle_h = 18.0
         p.setBrush(QColor("#bbbbbb"))
         p.setPen(QPen(QColor("#888888")))
-        handle1 = QRectF(lsx - handle_w / 2.0, bar_y - handle_h / 2.0 + bar_h / 2.0, handle_w, handle_h)
-        handle2 = QRectF(lex - handle_w / 2.0, bar_y - handle_h / 2.0 + bar_h / 2.0, handle_w, handle_h)
-        p.drawRect(handle1); p.drawRect(handle2)
+        p.drawRect(QRectF(lsx - handle_w/2.0, bar_y - handle_h/2.0 + bar_h/2.0, handle_w, handle_h))
+        p.drawRect(QRectF(lex - handle_w/2.0, bar_y - handle_h/2.0 + bar_h/2.0, handle_w, handle_h))
 
-        # play cursor
         p.setPen(QPen(QColor("#ffffff"), 2))
         p.drawLine(QPointF(posx, bar_y - 6.0), QPointF(posx, bar_y + bar_h + 6.0))
 
-        # time text
         p.setPen(QPen(QColor("#e6e6e6")))
         p.drawText(10, int(bar_y - 8.0), f"{self._fmt(self.position)}")
         p.drawText(int(w - 80.0), int(bar_y - 8.0), f"{self._fmt(self.duration)}")
@@ -457,8 +529,7 @@ class Timeline(QWidget):
         self.seekRequested.emit(newt)
 
     def mouseMoveEvent(self, ev):
-        if not self.dragging:
-            return
+        if not self.dragging: return
         x = float(ev.position().x()); w = float(self.rect().width())
         def t_from_x(xv): return (xv - 10.0) / max(1.0, (w - 20.0)) * self.duration
         t = max(0.0, min(self.duration, t_from_x(x)))
@@ -479,306 +550,263 @@ class Timeline(QWidget):
         self.dragging = None
 
 # ---------------------------
-# TrackRow
+# TrackRow UI
 # ---------------------------
 class TrackRow(QWidget):
-    def __init__(self, filename, sinks, assigned_sink=None, settings=None):
+    def __init__(self, filepath: str, sinks: List, assigned_sink=None, settings=None):
         super().__init__()
-        self.filename = str(filename)
+        self.filepath = filepath
         self.sinks = sinks
         self.assigned_sink = assigned_sink
         self.settings = settings or {}
-        self.player = TrackPlayer(filename, sink_name=assigned_sink)
-        self.current_volume_slider_value = 100
-        self.muted = False
-        self.solo = False
+        self.player = None  # TrackPlayerSD instance created in MainWindow.load_tracks
+        self.current_volume = 100
         self._build_ui()
         self._load_settings()
 
     def _build_ui(self):
         layout = QHBoxLayout(); self.setLayout(layout)
-        # name
-        self.name_label = QLabel(Path(self.filename).name)
+        self.name_label = QLabel(Path(self.filepath).name)
         layout.addWidget(self.name_label, 3)
-        # volume slider - longer
         self.vol_slider = QSlider(Qt.Orientation.Horizontal)
-        self.vol_slider.setRange(0, 120)
-        self.vol_slider.setValue(100)
+        self.vol_slider.setRange(0, 120); self.vol_slider.setValue(100)
         self.vol_slider.setFixedWidth(320)
-        layout.addWidget(QLabel("Vol"))
-        layout.addWidget(self.vol_slider, 0)
-        self.vol_label = QLabel("100%")
-        layout.addWidget(self.vol_label)
-        # mute & solo
+        layout.addWidget(QLabel("Vol")); layout.addWidget(self.vol_slider, 0)
+        self.vol_label = QLabel("100%"); layout.addWidget(self.vol_label)
         self.mute_cb = QCheckBox("Mute"); self.mute_cb.setFixedWidth(60)
         self.solo_cb = QCheckBox("Solo"); self.solo_cb.setFixedWidth(60)
-        layout.addWidget(self.mute_cb)
-        layout.addWidget(self.solo_cb)
-        # push everything left
+        layout.addWidget(self.mute_cb); layout.addWidget(self.solo_cb)
         layout.addStretch()
-        # output combo to right, minimal size
         self.sink_combo = QComboBox()
-        for s in self.sinks: self.sink_combo.addItem(s[1], s[1])
+        for s in self.sinks:
+            self.sink_combo.addItem(s[1], s[0])  # display name, data=index
         self.sink_combo.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.sink_combo, 0)
 
-        # signals
         self.sink_combo.currentIndexChanged.connect(self._on_sink_changed)
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
-        self.mute_cb.toggled.connect(self._on_mute_toggled)
-        self.solo_cb.toggled.connect(self._on_solo_toggled)
+        self.mute_cb.toggled.connect(lambda st: None)
+        self.solo_cb.toggled.connect(lambda st: None)
 
     def _load_settings(self):
-        name = Path(self.filename).name
-        entry = self.settings.get(name, {})
-        vol = entry.get('volume', 100)
-        self.vol_slider.setValue(int(vol)); self.current_volume_slider_value = int(vol)
-        self.muted = bool(entry.get('mute', False)); self.solo = bool(entry.get('solo', False))
-        self.mute_cb.setChecked(self.muted); self.solo_cb.setChecked(self.solo)
-        sink = entry.get('sink')
-        if sink:
-            idx2 = self.sink_combo.findData(sink)
-            if idx2 != -1: self.sink_combo.setCurrentIndex(idx2)
+        n = Path(self.filepath).name
+        e = self.settings.get(n, {})
+        vol = e.get('volume', 100)
+        self.vol_slider.setValue(int(vol)); self.vol_label.setText(f"{int(vol)}%")
+        sink = e.get('sink')
+        if sink is not None:
+            idx = self.sink_combo.findData(sink)
+            if idx != -1:
+                self.sink_combo.setCurrentIndex(idx)
+
+    def set_player(self, player: TrackPlayerSD):
+        self.player = player
+        # apply initial volume & sink
         try:
-            pv = float(self.current_volume_slider_value)
-            self.player.set_volume(pv)
-            if self.assigned_sink:
-                self.player.set_sink(self.assigned_sink)
+            self.player.set_volume_db(self.vol_slider.value())
         except Exception:
             pass
-
-    def save_settings(self):
-        return {
-            'sink': self.sink_combo.currentData(),
-            'volume': int(self.current_volume_slider_value),
-            'mute': bool(self.mute_cb.isChecked()),
-            'solo': bool(self.solo_cb.isChecked())
-        }
 
     def _on_sink_changed(self, idx):
-        sink = self.sink_combo.currentData()
-        # apply to player immediately
-        self.player.set_sink(sink)
+        data = self.sink_combo.currentData()
+        # data is sink index as string (from pactl) or device index int if fallback
+        if self.player:
+            try:
+                # try to interpret as int device index; else pass as string to set_device
+                try:
+                    didx = int(data)
+                except Exception:
+                    didx = data
+                self.player.set_device(didx)
+            except Exception as e:
+                print("Failed setting device:", e)
 
     def _on_volume_changed(self, val):
-        self.current_volume_slider_value = int(val); self.vol_label.setText(f"{int(val)}%")
-        try:
-            pv = float(self.current_volume_slider_value)
-            self.player.set_volume(pv)
-        except Exception:
-            pass
-
-    def _on_mute_toggled(self, state):
-        self.muted = bool(state)
-
-    def _on_solo_toggled(self, state):
-        self.solo = bool(state)
+        self.vol_label.setText(f"{int(val)}%")
+        self.current_volume = int(val)
+        if self.player:
+            try:
+                self.player.set_volume_db(val)
+            except Exception:
+                pass
 
 # ---------------------------
-# MainWindow
+# Main Window
 # ---------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Multitrack Player v14 - PyQt6")
-        self.resize(1220, 860)
-        self.setStyleSheet("""
-            QWidget { background-color: #2f2f2f; color: #e6e6e6; }
-            QPushButton { background-color: #444444; border: none; padding: 6px; border-radius: 6px; }
-            QPushButton:hover { background-color: #555555; }
-            QComboBox, QSpinBox, QLineEdit { background-color: #3a3a3a; padding: 3px; }
-        """)
+        self.setWindowTitle("Multitrack Player v15 - sounddevice")
+        self.resize(1200, 820)
+        self.setStyleSheet("QWidget { background-color: #2f2f2f; color: #e6e6e6 }")
 
-        # global config load
+        # globals
         self.global_cfg = load_global_config()
-        # load global tick file and other global settings
-        self.global_tick_file = self.global_cfg.get('tick_file')
-        self.global_pitch_engine = self.global_cfg.get('pitch_engine', DEFAULT_PITCH_ENGINE)
+        self.global_tick = self.global_cfg.get('tick_file')
         self.global_playback_rate = float(self.global_cfg.get('playback_rate', 1.0))
+        self.global_bpm = int(self.global_cfg.get('bpm', DEFAULT_BPM))
 
         self.sinks = list_pactl_sinks()
-        self.settings: Dict = {}
-        self.current_folder: Optional[Path] = None
-        self.track_rows = []
-        self.global_players = []
-        self.global_pitch_semitones = int(self.global_cfg.get('global_pitch', 0))
-        self.loop_list: Dict[str, list] = {}
-        self.current_loop_name: Optional[str] = None
+        # if no sinks via pactl, fallback to sounddevice device names
+        if not self.sinks and SD_AVAILABLE:
+            devs = sd.query_devices()
+            self.sinks = [(str(i), d['name']) for i,d in enumerate(devs) if d['max_output_channels']>0]
 
-        # ticks
-        self.bpm = int(self.global_cfg.get('bpm', DEFAULT_BPM))
-        self.tick_file = self.global_tick_file
-        self.tick_volume = int(self.global_cfg.get('tick_volume', DEFAULT_TICK_VOL))
-        self.countin_enabled = bool(self.global_cfg.get('countin_enabled', True))
-        self.tick_count = int(self.global_cfg.get('tick_count', 4))
-        self.tick_player = TickPlayer(self.tick_file, tick_volume=self.tick_volume)
+        self.settings = {}
+        self.current_folder = None
+        self.track_rows: List[TrackRow] = []
+        self.track_players: List[TrackPlayerSD] = []
 
+        self.timeline = Timeline(duration=10.0)
+        self.tick_player = TickPlayer(self.global_tick, vol=int(self.global_cfg.get('tick_volume', DEFAULT_TICK_VOL)))
+
+        self._build_ui()
+
+        self.ui_timer = QTimer(); self.ui_timer.setInterval(80)
+        self._last_ui_time = time.time()
+        self.ui_timer.timeout.connect(self.ui_tick); self.ui_timer.start()
+
+    def _build_ui(self):
         central = QWidget(); self.setCentralWidget(central); v = QVBoxLayout(); central.setLayout(v)
-
-        # top controls
         top = QHBoxLayout()
         self.open_btn = QPushButton("Open Folder"); top.addWidget(self.open_btn)
-        self.folder_label = QLabel("No folder selected"); top.addWidget(self.folder_label, 1)
+        self.folder_label = QLabel("No folder"); top.addWidget(self.folder_label, 1)
         self.refresh_btn = QPushButton("Refresh Outputs"); top.addWidget(self.refresh_btn)
         self.save_btn = QPushButton("Save Settings"); top.addWidget(self.save_btn)
         v.addLayout(top)
 
-        # timeline & transport
-        self.timeline = Timeline(duration=10.0); v.addWidget(self.timeline)
+        v.addWidget(self.timeline)
         transport = QHBoxLayout()
         self.play_btn = QPushButton("Play"); transport.addWidget(self.play_btn)
         self.pause_btn = QPushButton("Pause"); transport.addWidget(self.pause_btn)
         self.stop_btn = QPushButton("Stop"); transport.addWidget(self.stop_btn)
-
-        transport.addWidget(QLabel("Pitch engine:"))
-        self.pitch_engine_combo = QComboBox()
-        for e in PITCH_ENGINE_OPTIONS: self.pitch_engine_combo.addItem(e, e)
-        # select global
-        idx = self.pitch_engine_combo.findData(self.global_pitch_engine)
-        if idx != -1:
-            self.pitch_engine_combo.setCurrentIndex(idx)
-        transport.addWidget(self.pitch_engine_combo)
-
-        transport.addWidget(QLabel("Global pitch (semitones):"))
-        self.global_pitch_combo = QComboBox()
-        for s in range(-12, 13): self.global_pitch_combo.addItem(f"{s:+d}", s)
-        # set global pitch
-        idx2 = self.global_pitch_combo.findData(self.global_pitch_semitones)
-        if idx2 != -1:
-            self.global_pitch_combo.setCurrentIndex(idx2)
-        transport.addWidget(self.global_pitch_combo)
-
-        # playback rate controls (±5% step)
         transport.addWidget(QLabel("Playback rate:"))
-        self.rate_minus_btn = QPushButton("–"); self.rate_plus_btn = QPushButton("+")
-        self.rate_minus_btn.setFixedWidth(28); self.rate_plus_btn.setFixedWidth(28)
-        transport.addWidget(self.rate_minus_btn)
-        self.playback_rate_label = QLabel(f"{int(round(self.global_playback_rate*100))}%"); transport.addWidget(self.playback_rate_label)
-        transport.addWidget(self.rate_plus_btn)
-
+        self.rate_minus = QPushButton("–"); self.rate_plus = QPushButton("+")
+        self.rate_minus.setFixedWidth(28); self.rate_plus.setFixedWidth(28)
+        transport.addWidget(self.rate_minus)
+        self.rate_label = QLabel(f"{int(round(self.global_playback_rate*100))}%"); transport.addWidget(self.rate_label)
+        transport.addWidget(self.rate_plus)
         v.addLayout(transport)
 
-        # loop & tick controls
         loop_h = QHBoxLayout()
         self.loop_toggle = QCheckBox("Loop On"); loop_h.addWidget(self.loop_toggle)
-        self.loop_save_btn = QPushButton("Save Loop"); loop_h.addWidget(self.loop_save_btn)
-        self.loop_delete_btn = QPushButton("Delete Loop"); loop_h.addWidget(self.loop_delete_btn)
+        self.loop_save = QPushButton("Save Loop"); loop_h.addWidget(self.loop_save)
+        self.loop_delete = QPushButton("Delete Loop"); loop_h.addWidget(self.loop_delete)
         self.loop_select = QComboBox(); loop_h.addWidget(self.loop_select, 1)
         loop_h.addWidget(QLabel("BPM:"))
-        self.bpm_spin = QSpinBox(); self.bpm_spin.setRange(30, 300); self.bpm_spin.setValue(self.bpm); loop_h.addWidget(self.bpm_spin)
-        loop_h.addWidget(QLabel("Tick count:"))
-        self.tick_count_spin = QSpinBox(); self.tick_count_spin.setRange(1, 16); self.tick_count_spin.setValue(self.tick_count); loop_h.addWidget(self.tick_count_spin)
-        self.countin_cb = QCheckBox("Count-in"); self.countin_cb.setChecked(self.countin_enabled); loop_h.addWidget(self.countin_cb)
+        self.bpm_spin = QSpinBox(); self.bpm_spin.setRange(30, 300); self.bpm_spin.setValue(self.global_bpm); loop_h.addWidget(self.bpm_spin)
         loop_h.addWidget(QLabel("Tick sound (global):"))
-        self.tick_label = QLineEdit(); self.tick_label.setReadOnly(True); self.tick_label.setText(self.tick_file or ""); loop_h.addWidget(self.tick_label, 2)
+        self.tick_label = QLineEdit(); self.tick_label.setReadOnly(True); self.tick_label.setText(self.global_tick or ""); loop_h.addWidget(self.tick_label, 2)
         self.tick_browse = QPushButton("Browse"); loop_h.addWidget(self.tick_browse)
         loop_h.addWidget(QLabel("Tick vol:"))
-        self.tick_vol_spin = QSpinBox(); self.tick_vol_spin.setRange(0, 200); self.tick_vol_spin.setValue(self.tick_volume); loop_h.addWidget(self.tick_vol_spin)
+        self.tick_vol_spin = QSpinBox(); self.tick_vol_spin.setRange(0, 200); self.tick_vol_spin.setValue(int(self.global_cfg.get('tick_volume', DEFAULT_TICK_VOL))); loop_h.addWidget(self.tick_vol_spin)
         v.addLayout(loop_h)
 
-        # tracks area
         self.tracks_area = QScrollArea(); self.tracks_widget = QWidget(); self.tracks_layout = QVBoxLayout(); self.tracks_widget.setLayout(self.tracks_layout)
         self.tracks_area.setWidgetResizable(True); self.tracks_area.setWidget(self.tracks_widget); v.addWidget(self.tracks_area)
 
-        # signals
+        # connect
         self.open_btn.clicked.connect(self.on_open)
         self.refresh_btn.clicked.connect(self.on_refresh)
         self.save_btn.clicked.connect(self.on_save)
         self.play_btn.clicked.connect(self.on_play)
         self.pause_btn.clicked.connect(self.on_pause)
         self.stop_btn.clicked.connect(self.on_stop)
-        self.pitch_engine_combo.currentIndexChanged.connect(self.on_pitch_engine_changed)
-        self.global_pitch_combo.currentIndexChanged.connect(self.on_global_pitch_changed)
-        self.rate_plus_btn.clicked.connect(self.on_rate_plus)
-        self.rate_minus_btn.clicked.connect(self.on_rate_minus)
-        self.loop_save_btn.clicked.connect(self.on_save_loop)
-        self.loop_delete_btn.clicked.connect(self.on_delete_loop)
+        self.rate_plus.clicked.connect(self.on_rate_plus)
+        self.rate_minus.clicked.connect(self.on_rate_minus)
+        self.loop_save.clicked.connect(self.on_save_loop)
+        self.loop_delete.clicked.connect(self.on_delete_loop)
         self.loop_select.currentIndexChanged.connect(self.on_loop_selected)
         self.timeline.seekRequested.connect(self.on_seek_requested)
         self.timeline.loopChanged.connect(self.on_loop_changed)
         self.loop_toggle.stateChanged.connect(self.on_loop_toggled)
-        self.bpm_spin.valueChanged.connect(self.on_bpm_changed)
+        self.bpm_spin.valueChanged.connect(lambda v: setattr(self, 'global_bpm', int(v)))
         self.tick_browse.clicked.connect(self.on_browse_tick)
-        self.countin_cb.toggled.connect(self.on_countin_toggled)
         self.tick_vol_spin.valueChanged.connect(self.on_tick_vol_changed)
-        self.tick_count_spin.valueChanged.connect(self.on_tick_count_changed)
-
-        # UI timer
-        self.ui_timer = QTimer(); self.ui_timer.setInterval(80)  # ~12.5 FPS UI update
-        self._last_ui_time = time.time()
-        self.ui_timer.timeout.connect(self.ui_tick); self.ui_timer.start()
 
     # ---------------------------
-    # File & tracks
+    # File & load tracks
     # ---------------------------
     def on_open(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select folder with audio files", str(Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, "Select folder", str(Path.home()))
         if not folder:
             return
         self.current_folder = Path(folder)
-        self.folder_label.setText(folder)
+        self.folder_label.setText(str(self.current_folder))
         settings_path = self.current_folder / SETTINGS_NAME
         if settings_path.exists():
             try:
-                with open(settings_path, 'r') as f: self.settings = json.load(f)
+                with open(settings_path, 'r') as f:
+                    self.settings = json.load(f)
             except Exception:
                 self.settings = {}
         else:
             self.settings = {}
-        # load globals from folder-specific settings if present (fallback to global)
+        # load global folder-specific settings
         g = self.settings.get('_global', {})
-        self.bpm = g.get('bpm', self.bpm); self.bpm_spin.setValue(self.bpm)
-        # folder-specific tick overrides global only if present
-        folder_tick = g.get('tick_file')
-        if folder_tick:
-            self.tick_file = folder_tick
-        # global tick preference remains in menu display
-        self.tick_label.setText(self.tick_file or (self.global_cfg.get('tick_file') or ""))
-        self.tick_volume = g.get('tick_volume', self.tick_volume); self.tick_vol_spin.setValue(self.tick_volume)
-        self.tick_player.set_tick_volume(self.tick_volume)
-        self.countin_enabled = g.get('countin_enabled', self.countin_enabled); self.countin_cb.setChecked(self.countin_enabled)
-        self.tick_count = g.get('tick_count', self.tick_count); self.tick_count_spin.setValue(self.tick_count)
-        self.global_pitch_semitones = g.get('global_pitch', self.global_pitch_semitones)
-        idx = self.global_pitch_combo.findData(self.global_pitch_semitones)
-        if idx != -1: self.global_pitch_combo.setCurrentIndex(idx)
-        self.global_pitch_engine = g.get('pitch_engine', self.global_pitch_engine)
-        idx2 = self.pitch_engine_combo.findData(self.global_pitch_engine)
-        if idx2 != -1: self.pitch_engine_combo.setCurrentIndex(idx2)
+        if g.get('tick_file'):
+            self.global_tick = g.get('tick_file')
+        self.tick_label.setText(self.global_tick or "")
+        self.tick_player.set_tick_file(self.global_tick)
         self.global_playback_rate = g.get('playback_rate', self.global_playback_rate)
-        self._update_playback_rate_label()
-        # load tracks
+        self._update_rate_label()
         self.load_tracks(folder)
 
     def load_tracks(self, folder):
-        # clear old
-        for r in self.track_rows:
-            try: r.player.stop(); r.deleteLater()
+        # cleanup old
+        for p in self.track_players:
+            try: p.stop()
             except Exception: pass
-        self.track_rows = []; self.global_players = []
+        for r in self.track_rows:
+            try: r.deleteLater()
+            except Exception: pass
+        self.track_rows = []; self.track_players = []
+
+        # refresh sinks
         self.sinks = list_pactl_sinks()
+        if not self.sinks and SD_AVAILABLE:
+            devs = sd.query_devices()
+            self.sinks = [(str(i), d['name']) for i,d in enumerate(devs) if d['max_output_channels']>0]
+
         files = [p for p in sorted(Path(folder).iterdir()) if p.suffix.lower() in AUDIO_EXTS]
         durations = []
-        for p in files:
+        for pth in files:
+            row = TrackRow(str(pth), self.sinks, settings=self.settings)
+            self.tracks_layout.addWidget(row)
+            self.track_rows.append(row)
+            # create TrackPlayerSD for each
+            # determine assigned sink from settings
             assigned = None
-            s = self.settings.get(p.name, {})
-            if s:
-                assigned = s.get('sink')
-            row = TrackRow(str(p), self.sinks, assigned_sink=assigned, settings=self.settings)
-            self.tracks_layout.addWidget(row); self.track_rows.append(row); self.global_players.append(row.player)
-            dur = get_audio_duration(p)
-            if dur <= 0 and row.player:
+            ent = self.settings.get(Path(pth).name, {})
+            if ent:
+                assigned = ent.get('sink')
+            # map assigned sink: if assigned corresponds to pactl index string, use that; else try int index
+            devidx = None
+            if assigned is not None:
                 try:
-                    dur = row.player.get_duration()
+                    devidx = int(assigned)
                 except Exception:
-                    dur = 0.0
-            durations.append(dur)
+                    devidx = assigned
+            try:
+                tp = TrackPlayerSD(pth, device_index=devidx)
+                tp.set_playback_rate(self.global_playback_rate)
+                row.set_player(tp)
+                self.track_players.append(tp)
+                durations.append(tp.get_duration())
+                # select sink combo if assigned
+                if assigned is not None:
+                    idx = row.sink_combo.findData(assigned)
+                    if idx != -1:
+                        row.sink_combo.setCurrentIndex(idx)
+            except Exception as e:
+                print("Failed to init TrackPlayerSD:", e)
         self.tracks_layout.addStretch(1)
         maxdur = max(durations) if durations else 10.0
         if not maxdur or maxdur <= 1.0:
             maxdur = 10.0
         self.timeline.set_duration(maxdur)
 
-        # load loops and autoselect
+        # load loops
         g = self.settings.get('_global', {})
         loops = g.get('loops', {})
         self.loop_list = loops if loops else {}
@@ -792,141 +820,61 @@ class MainWindow(QMainWindow):
             chosen = None
         if chosen:
             rng = self.loop_list[chosen]
-            self.current_loop_name = chosen
             self.timeline.set_loop(rng[0], rng[1])
-            idx = self.loop_select.findText(chosen)
-            if idx != -1:
-                self.loop_select.setCurrentIndex(idx)
+            self.loop_select.setCurrentText(chosen)
         else:
-            self.current_loop_name = None
             self.timeline.set_loop(0.0, maxdur)
-
-        # ensure players reflect playback rate & sinks immediately (if needed)
-        for idx, p in enumerate(self.global_players):
-            try:
-                if p.player:
-                    p.player.speed = self.global_playback_rate
-                    # ensure sink is properly set from its TrackRow
-                    tr = self.track_rows[idx]
-                    sink = tr.sink_combo.currentData()
-                    if sink:
-                        p.set_sink(sink)
-            except Exception:
-                pass
 
     def on_refresh(self):
         self.sinks = list_pactl_sinks()
-        for row in self.track_rows:
-            cur = row.sink_combo.currentData(); row.sink_combo.clear()
-            for s in self.sinks: row.sink_combo.addItem(s[1], s[1])
+        for r in self.track_rows:
+            cur = r.sink_combo.currentData()
+            r.sink_combo.clear()
+            for s in self.sinks:
+                r.sink_combo.addItem(s[1], s[0])
             if cur:
-                idx = row.sink_combo.findData(cur)
-                if idx != -1: row.sink_combo.setCurrentIndex(idx)
+                idx = r.sink_combo.findData(cur)
+                if idx != -1:
+                    r.sink_combo.setCurrentIndex(idx)
 
     # ---------------------------
-    # Mute/Solo/Volume
+    # Loop UI
     # ---------------------------
-    def apply_mute_solo_logic(self):
-        solos = [r for r in self.track_rows if r.solo_cb.isChecked()]
-        if solos:
-            for r in self.track_rows:
-                try:
-                    if r.solo_cb.isChecked() and not r.mute_cb.isChecked():
-                        pv = float(r.current_volume_slider_value)
-                        r.player.set_volume(pv)
-                    else:
-                        r.player.set_volume(0.0)
-                except Exception:
-                    pass
-        else:
-            for r in self.track_rows:
-                try:
-                    if r.mute_cb.isChecked():
-                        r.player.set_volume(0.0)
-                    else:
-                        pv = float(r.current_volume_slider_value)
-                        r.player.set_volume(pv)
-                except Exception:
-                    pass
-
-    # ---------------------------
-    # Save/load config
-    # ---------------------------
-    def on_save(self):
-        # save folder-specific settings + global config
-        if not self.current_folder:
-            QMessageBox.information(self, "Info", "No folder selected"); return
-        self.save_config(self.current_folder)
-        # save global config
-        self.global_cfg['tick_file'] = self.tick_file
-        self.global_cfg['tick_volume'] = int(self.tick_volume)
-        self.global_cfg['pitch_engine'] = self.global_pitch_engine
-        self.global_cfg['playback_rate'] = float(self.global_playback_rate)
-        self.global_cfg['global_pitch'] = int(self.global_pitch_semitones)
-        save_global_config(self.global_cfg)
-        QMessageBox.information(self, "Saved", f"Settings saved to folder and global config.")
-
-    def save_config(self, folder: Path):
-        data = {}
-        for row in self.track_rows:
-            data[Path(row.filename).name] = row.save_settings()
-        data['_global'] = {
-            'loops': self.loop_list,
-            'last_used_loop': self.current_loop_name,
-            'bpm': int(self.bpm_spin.value()),
-            'tick_file': self.tick_file,
-            'tick_volume': int(self.tick_vol_spin.value()),
-            'countin_enabled': bool(self.countin_cb.isChecked()),
-            'tick_count': int(self.tick_count_spin.value()),
-            'pitch_engine': self.global_pitch_engine,
-            'global_playback': float(self.global_playback_rate),
-            'global_pitch': int(self.global_pitch_semitones),
-            'playback_rate': float(self.global_playback_rate)
-        }
-        settings_path = Path(folder) / SETTINGS_NAME
-        try:
-            with open(settings_path, 'w') as f: json.dump(data, f, indent=2)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save settings: {e}")
-
     def update_loop_dropdown(self):
         self.loop_select.blockSignals(True)
         self.loop_select.clear()
         self.loop_select.addItem("Select loop...", None)
-        for name, rng in self.loop_list.items():
+        for name, rng in (self.loop_list.items() if hasattr(self,'loop_list') else []):
             self.loop_select.addItem(name, (name, rng))
         self.loop_select.blockSignals(False)
 
-    # ---------------------------
-    # Loop handlers
-    # ---------------------------
     def on_save_loop(self):
         name, ok = QInputDialog.getText(self, "Save loop", "Loop name:")
         if not ok or not name:
             return
         start, end = float(self.timeline.loop_start), float(self.timeline.loop_end)
-        self.loop_list[name] = [start, end]  # overwrite if exists
-        # mark as last used
+        if not hasattr(self, 'loop_list'):
+            self.loop_list = {}
+        self.loop_list[name] = [start, end]
         self.current_loop_name = name
-        # update memory settings and UI
         self.update_loop_dropdown()
         idx = self.loop_select.findText(name)
         if idx != -1:
             self.loop_select.setCurrentIndex(idx)
+        # store in settings memory
         if '_global' not in self.settings:
             self.settings['_global'] = {}
         self.settings['_global']['last_used_loop'] = name
 
     def on_delete_loop(self):
-        cur = self.loop_select.currentData()
-        if not cur:
-            QMessageBox.information(self, "Info", "No loop selected to delete"); return
-        name, rng = cur
-        if name in self.loop_list:
+        data = self.loop_select.currentData()
+        if not data:
+            QMessageBox.information(self, "Info", "No loop selected")
+            return
+        name, rng = data
+        if hasattr(self,'loop_list') and name in self.loop_list:
             del self.loop_list[name]
-        if self.current_loop_name == name:
-            self.current_loop_name = None
-        self.update_loop_dropdown()
+            self.update_loop_dropdown()
 
     def on_loop_selected(self, idx):
         data = self.loop_select.currentData()
@@ -935,242 +883,204 @@ class MainWindow(QMainWindow):
         name, rng = data
         self.current_loop_name = name
         self.timeline.set_loop(rng[0], rng[1])
-        # save last used in memory
         if '_global' not in self.settings:
             self.settings['_global'] = {}
         self.settings['_global']['last_used_loop'] = name
 
     def on_loop_toggled(self, state):
         if state:
-            if self.global_players:
-                start = self.timeline.loop_start
-                for p in self.global_players:
-                    try: p.seek(start)
-                    except Exception: pass
-                self.timeline.set_position(start)
+            start = self.timeline.loop_start
+            for p in self.track_players:
+                try: p.seek(start)
+                except Exception: pass
+            self.timeline.set_position(start)
 
     def on_loop_changed(self, s, e):
-        # user manually adjusted loop handles (no automatic naming)
+        # manual loop change -> not auto-named
         self.current_loop_name = None
 
     # ---------------------------
-    # Playback & Count-in
+    # Playback controls
     # ---------------------------
     def on_play(self):
-        if not self.global_players:
+        if not self.track_players:
             return
         start = 0.0
         if self.loop_toggle.isChecked():
             start = self.timeline.loop_start
-        # prepare sinks, volumes, apply global pitch af
-        for r in self.track_rows:
+        # apply sinks & volumes & playback rate
+        for idx, row in enumerate(self.track_rows):
             try:
-                # set sink on player
-                sink = r.sink_combo.currentData()
-                if sink:
-                    r.player.set_sink(sink)
-                pv = float(r.current_volume_slider_value)
-                r.player.set_volume(pv)
-                r.player.apply_pitch_af(self.global_pitch_semitones, self.global_pitch_engine)
+                tp = self.track_players[idx]
+                sink_data = row.sink_combo.currentData()
+                if sink_data is not None:
+                    try:
+                        didx = int(sink_data)
+                    except Exception:
+                        didx = sink_data
+                    tp.set_device(didx)
+                tp.set_playback_rate(self.global_playback_rate)
+                tp.set_volume_db(row.vol_slider.value())
             except Exception:
                 pass
-        # ensure players have current playback rate
-        for p in self.global_players:
+        # start streams
+        for tp in self.track_players:
             try:
-                if p.player:
-                    p.player.speed = self.global_playback_rate
-            except Exception:
-                pass
-        if self.countin_cb.isChecked():
-            t = threading.Thread(target=self._run_countin_and_start, args=(start,), daemon=True)
-            t.start()
-        else:
-            for p in self.global_players:
-                try: p.play(start_pos=start, speed=self.global_playback_rate)
-                except Exception: pass
-            self.apply_mute_solo_logic()
-
-    def _run_countin_and_start(self, start_pos: float):
-        bpm = int(self.bpm_spin.value()) or DEFAULT_BPM
-        interval = 60.0 / bpm
-        ticks = int(self.tick_count_spin.value()) or 4
-        for i in range(ticks):
-            try:
-                self.tick_player.play_tick()
-            except Exception:
-                pass
-            time.sleep(interval)
-        for p in self.global_players:
-            try: p.play(start_pos=start_pos, speed=self.global_playback_rate)
-            except Exception: pass
-        time.sleep(0.01)
-        QTimer.singleShot(0, self.apply_mute_solo_logic)
+                tp.play(start_pos=start)
+            except Exception as e:
+                print("Error starting track:", e)
+        # ensure UI reflects correct position
+        self.timeline.set_position(start)
 
     def on_pause(self):
-        for p in self.global_players:
-            try: p.pause()
-            except Exception: pass
+        for tp in self.track_players:
+            try:
+                tp.stop()
+            except Exception:
+                pass
 
     def on_stop(self):
-        for p in self.global_players:
-            try: p.stop()
-            except Exception: pass
+        for tp in self.track_players:
+            try:
+                tp.stop()
+            except Exception:
+                pass
+        if hasattr(self,'track_players'):
+            for tp in self.track_players:
+                tp.position = 0.0
+        self.timeline.set_position(0.0)
 
     # ---------------------------
-    # Playback rate controls
+    # Playback rate
     # ---------------------------
-    def _update_playback_rate_label(self):
-        pct = int(round(self.global_playback_rate * 100))
-        self.playback_rate_label.setText(f"{pct}%")
+    def _update_rate_label(self):
+        self.rate_label.setText(f"{int(round(self.global_playback_rate*100))}%")
 
     def on_rate_plus(self):
         new = round(self.global_playback_rate + PLAYBACK_RATE_STEP, 3)
-        if new > PLAYBACK_RATE_MAX:
-            new = PLAYBACK_RATE_MAX
+        if new > PLAYBACK_RATE_MAX: new = PLAYBACK_RATE_MAX
         self.global_playback_rate = new
-        # apply to running players immediately
-        for p in self.global_players:
-            try:
-                if p.player:
-                    p.player.speed = self.global_playback_rate
-            except Exception:
-                pass
-        # persist to global config memory
+        for tp in self.track_players:
+            tp.set_playback_rate(self.global_playback_rate)
         self.global_cfg['playback_rate'] = float(self.global_playback_rate)
-        self._update_playback_rate_label()
+        self._update_rate_label()
 
     def on_rate_minus(self):
         new = round(self.global_playback_rate - PLAYBACK_RATE_STEP, 3)
-        if new < PLAYBACK_RATE_MIN:
-            new = PLAYBACK_RATE_MIN
+        if new < PLAYBACK_RATE_MIN: new = PLAYBACK_RATE_MIN
         self.global_playback_rate = new
-        for p in self.global_players:
-            try:
-                if p.player:
-                    p.player.speed = self.global_playback_rate
-            except Exception:
-                pass
+        for tp in self.track_players:
+            tp.set_playback_rate(self.global_playback_rate)
         self.global_cfg['playback_rate'] = float(self.global_playback_rate)
-        self._update_playback_rate_label()
-
-    def on_pitch_engine_changed(self, idx):
-        eng = self.pitch_engine_combo.currentData()
-        if eng:
-            self.global_pitch_engine = eng
-            self.global_cfg['pitch_engine'] = eng
-        for r in self.track_rows:
-            try:
-                r.player.apply_pitch_af(self.global_pitch_semitones, self.global_pitch_engine)
-            except Exception:
-                pass
-
-    def on_global_pitch_changed(self, idx):
-        val = int(self.global_pitch_combo.currentData())
-        self.global_pitch_semitones = val
-        self.global_cfg['global_pitch'] = int(val)
-        for r in self.track_rows:
-            try:
-                r.player.apply_pitch_af(self.global_pitch_semitones, self.global_pitch_engine)
-            except Exception:
-                pass
+        self._update_rate_label()
 
     # ---------------------------
-    # BPM / tick / misc handlers
+    # Tick handlers
     # ---------------------------
-    def on_bpm_changed(self, val):
-        try: self.bpm = int(val)
-        except Exception: self.bpm = DEFAULT_BPM
-
     def on_browse_tick(self):
         f = QFileDialog.getOpenFileName(self, "Select tick sound (global)", str(Path.home()), "Audio files (*.wav *.ogg *.mp3 *.flac)")[0]
         if not f: return
-        self.tick_file = f; self.tick_label.setText(self.tick_file); self.tick_player.set_tick_file(self.tick_file)
-        # save to global cfg in memory (not writing file until explicit Save)
-        self.global_cfg['tick_file'] = self.tick_file
+        self.global_tick = f
+        self.tick_label.setText(self.global_tick)
+        self.tick_player.set_tick_file(self.global_tick)
+        self.global_cfg['tick_file'] = self.global_tick
 
-    def on_countin_toggled(self, state):
-        self.countin_enabled = bool(state)
-
-    def on_tick_vol_changed(self, val):
-        self.tick_volume = int(val); self.tick_player.set_tick_volume(self.tick_volume)
-        self.global_cfg['tick_volume'] = int(self.tick_volume)
-
-    def on_tick_count_changed(self, val):
-        self.tick_count = int(val)
+    def on_tick_vol_changed(self, v):
+        self.tick_player.vol = int(v)
+        self.global_cfg['tick_volume'] = int(v)
 
     # ---------------------------
-    # UI tick (synchronized to actual audio time)
+    # Save settings
+    # ---------------------------
+    def on_save(self):
+        if not self.current_folder:
+            QMessageBox.information(self, "Info", "No folder opened")
+            return
+        # save folder-specific
+        data = {}
+        for idx, row in enumerate(self.track_rows):
+            key = Path(row.filepath).name
+            sink = row.sink_combo.currentData()
+            data[key] = {'sink': sink, 'volume': row.vol_slider.value(), 'mute': False, 'solo': False}
+        data['_global'] = {
+            'loops': getattr(self,'loop_list',{}),
+            'last_used_loop': getattr(self,'current_loop_name', None),
+            'bpm': int(self.bpm_spin.value()),
+            'tick_file': self.global_tick,
+            'tick_volume': int(self.tick_vol_spin.value()),
+            'playback_rate': float(self.global_playback_rate)
+        }
+        try:
+            with open(self.current_folder / SETTINGS_NAME, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save folder settings: {e}")
+        # save global config
+        self.global_cfg['tick_file'] = self.global_tick
+        self.global_cfg['tick_volume'] = int(self.tick_vol_spin.value())
+        self.global_cfg['playback_rate'] = float(self.global_playback_rate)
+        save_global_config(self.global_cfg)
+        QMessageBox.information(self, "Saved", "Settings saved (folder + global).")
+
+    # ---------------------------
+    # UI tick: update timeline position from first player
     # ---------------------------
     def ui_tick(self):
         now = time.time()
-        dt = now - self._last_ui_time if hasattr(self, '_last_ui_time') else 0.08
+        dt = now - self._last_ui_time
         self._last_ui_time = now
-
-        # Advance timeline's pulse phase for visual pulsing
         self.timeline.advance_pulse(dt)
-
-        if not self.global_players:
+        if not self.track_players:
             return
-
-        # Use the primary player's reported time_pos as source of truth
+        # take primary player's position as source of truth
         try:
-            pos = self.global_players[0].get_time_pos()
+            pos = self.track_players[0].get_time_pos()
         except Exception:
             pos = 0.0
-
-        # Update timeline position directly from player time_pos (seconds)
         self.timeline.set_position(pos)
-
-        # Loop handling: if looping enabled and we've passed loop end, seek to loop start
+        # loop handling
         if self.loop_toggle.isChecked():
             start, end = self.timeline.loop_start, self.timeline.loop_end
             if pos >= end - 0.02:
-                for p in self.global_players:
+                for p in self.track_players:
                     try:
                         p.seek(start)
                     except Exception:
                         pass
-                # update timeline position so UI immediately reflects the seek
                 self.timeline.set_position(start)
-
-        # Ensure duration stays accurate if mpv reports it
+        # update duration if available
         try:
-            dur = self.global_players[0].get_duration()
+            dur = self.track_players[0].get_duration()
             if dur and dur > 0:
                 self.timeline.set_duration(dur)
         except Exception:
             pass
 
-        # Apply mute/solo after any tempo/seek adjustments
-        self.apply_mute_solo_logic()
-
     def on_seek_requested(self, seconds):
-        for p in self.global_players:
-            try: p.seek(seconds)
-            except Exception: pass
+        for p in self.track_players:
+            try:
+                p.seek(seconds)
+            except Exception:
+                pass
 
-    # ---------------------------
-    # Close & save
-    # ---------------------------
-    def closeEvent(self, event):
+    def closeEvent(self, ev):
         try:
-            if self.current_folder:
-                self.save_config(self.current_folder)
-            # Save global config automatically on exit
-            save_global_config(self.global_cfg)
+            for tp in self.track_players:
+                tp.stop()
         except Exception:
             pass
-        for r in self.track_rows:
-            try: r.player.stop()
-            except Exception: pass
-        super().closeEvent(event)
+        # save global config automatically on exit
+        save_global_config(self.global_cfg)
+        super().closeEvent(ev)
 
 # ---------------------------
-# main entry
+# Main
 # ---------------------------
 def main():
-    if mpv is None:
-        print("Warning: python-mpv not installed. UI will run but audio won't play.")
+    if not SD_AVAILABLE:
+        print("Warning: sounddevice not available. Install with `pip install sounddevice`.")
+    if not SF_AVAILABLE:
+        print("Warning: soundfile not available. Install with `pip install soundfile`.")
     app = QApplication(sys.argv)
     mw = MainWindow()
     mw.show()
