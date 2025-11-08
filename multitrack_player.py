@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # multitrack_player_v17.py
-# Multitrack Player v17 - sounddevice multi-output (name-based devices) + Test tone
-# - LC_NUMERIC fix
-# - device selection by name (stable for PipeWire/PulseAudio)
-# - per-track "Test" button plays short sine on selected device
-# - stream rebuilt on device change, playback resumes at same position
+# Multitrack Player v17 - sounddevice + pulsectl integration
+# - os.environ["LC_NUMERIC"] = "C" included
+# - name-based device selection (pactl/pulsectl)
+# - after starting sounddevice stream, try to move sink_input to chosen sink via pulsectl
+# - per-track Test button
 # - PyQt6 GUI
 
 import os
@@ -57,6 +57,13 @@ try:
 except Exception:
     MUTAGEN_AVAILABLE = False
 
+# pulsectl is optional but recommended for reliable sink routing (PulseAudio / PipeWire)
+try:
+    import pulsectl
+    PULSECTL_AVAILABLE = True
+except Exception:
+    PULSECTL_AVAILABLE = False
+
 # Paths & constants
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "multitrack_player"
 GLOBAL_CONFIG_FILE = GLOBAL_CONFIG_DIR / "config.json"
@@ -88,14 +95,13 @@ def save_global_config(cfg):
         print("Couldn't save global config:", e)
 
 def list_pactl_sinks():
-    """Return list of sink 'names' from pactl if possible (e.g. alsa_output..., bluez_output...), else []"""
+    """Return list of sink 'names' from pactl if possible."""
     try:
         out = subprocess.check_output(['pactl', 'list', 'short', 'sinks'], text=True)
         sinks = []
         for line in out.strip().splitlines():
             parts = line.split('\t')
             if len(parts) >= 2:
-                # parts: index, name, ... ; use name field (Pulse/PipeWire style)
                 name = parts[1]
                 sinks.append(name)
         return sinks
@@ -103,7 +109,6 @@ def list_pactl_sinks():
         return []
 
 def query_sd_output_devices() -> List[Dict]:
-    """Return sounddevice output-capable devices as list of dict with keys 'index' and 'name'."""
     out = []
     if not SD_AVAILABLE:
         return out
@@ -117,26 +122,19 @@ def query_sd_output_devices() -> List[Dict]:
     return out
 
 def build_output_device_list() -> List[str]:
-    """Return ordered list of device display names for the GUI.
-       Priority: 'default', pactl sink names, sd.query_devices names (unique)."""
     names = []
     names.append("default")
-    # add pactl sinks first (these are often the PipeWire/Pulse names)
     for s in list_pactl_sinks():
         if s not in names:
             names.append(s)
-    # fallback to sounddevice device names (more user-friendly)
     for d in query_sd_output_devices():
         if d['name'] not in names:
             names.append(d['name'])
     return names
 
 def find_sd_device_index_by_name(name: str) -> Optional[int]:
-    """Try to find a sounddevice device index matching the given name string.
-       Accepts exact match, substring match (case-insensitive) or numeric index string."""
     if not SD_AVAILABLE or name is None:
         return None
-    # direct numeric index?
     try:
         if isinstance(name, (int, float)) or (isinstance(name, str) and name.isdigit()):
             return int(name)
@@ -146,16 +144,13 @@ def find_sd_device_index_by_name(name: str) -> Optional[int]:
         devs = sd.query_devices()
     except Exception:
         return None
-    # exact name first
     for i, d in enumerate(devs):
         if d.get('name') == name and d.get('max_output_channels', 0) > 0:
             return i
-    # substring match (case-insensitive)
-    lname = name.lower()
+    lname = (name or "").lower()
     for i, d in enumerate(devs):
         if d.get('max_output_channels', 0) > 0 and lname in d.get('name', '').lower():
             return i
-    # last resort: first output-capable device
     for i, d in enumerate(devs):
         if d.get('max_output_channels', 0) > 0:
             return i
@@ -206,13 +201,13 @@ def open_soundfile_with_fallback(path: Path):
             raise e
 
 # ---------------------------
-# TrackPlayer using sounddevice (name-based device selection)
+# TrackPlayer using sounddevice + pulsectl post-move
 # ---------------------------
 class TrackPlayerSD:
-    def __init__(self, path: Path, device_name: Optional[str] = None):
+    def __init__(self, path: Path, device_name: Optional[str] = None, pulse_client: Optional[object] = None):
         self.path = Path(path)
-        self.device_name = device_name  # stored as name (e.g. "default" or "alsa_output.usb-...")
-        self.device_index = None       # resolved via sd.query_devices when needed
+        self.device_name = device_name  # e.g. "default" or "bluez_output...."
+        self.device_index = None
         self.sf = None
         self._temp_wav = None
         self.stream = None
@@ -226,12 +221,13 @@ class TrackPlayerSD:
         self.samplerate = 48000
         self.stop_flag = threading.Event()
         self.volume = 1.0
+        self.pulse_client = pulse_client  # pulsectl.Pulse instance or None
+        self.moved_sink_inputs = set()  # sink_input indexes moved for this track (best-effort)
         self._open_file()
 
     def _open_file(self):
         if not SF_AVAILABLE:
             raise RuntimeError("soundfile not installed")
-        sf_obj = None; tmp = None
         try:
             sf_obj, tmp = open_soundfile_with_fallback(self.path)
             self.sf = sf_obj
@@ -249,37 +245,31 @@ class TrackPlayerSD:
         return name or "default"
 
     def _resolve_device_index(self):
-        """Resolve self.device_name to a sounddevice index; store in self.device_index."""
         if not SD_AVAILABLE:
             self.device_index = None
             return None
         if self.device_name is None or self.device_name == "default":
             self.device_index = None
             return None
-        # first try numeric
         try:
             if isinstance(self.device_name, (int, float)) or (isinstance(self.device_name, str) and self.device_name.isdigit()):
                 self.device_index = int(self.device_name)
                 return self.device_index
         except Exception:
             pass
-        # try matching sd devices by name
         idx = find_sd_device_index_by_name(self.device_name)
         self.device_index = idx
         return idx
 
     def _create_stream(self):
-        """Create or recreate OutputStream using resolved device index."""
         if not SD_AVAILABLE:
             return False
-        # close existing
         if self.stream:
             try:
                 self.stream.stop(); self.stream.close()
             except Exception:
                 pass
             self.stream = None
-        # resolve index
         dev_idx = self._resolve_device_index()
         try:
             self.stream = sd.OutputStream(
@@ -293,7 +283,6 @@ class TrackPlayerSD:
             )
             return True
         except Exception as e:
-            # fallback to default device
             try:
                 print(f"[AudioRouting] Warning: failed to open device {self._device_repr(self.device_name)} -> {e}. Falling back to default device.")
                 self.stream = sd.OutputStream(
@@ -311,16 +300,14 @@ class TrackPlayerSD:
                 return False
 
     def set_device_by_name(self, device_name: Optional[str]):
-        """Set device name (string) and rebuild stream preserving position and playing state."""
         old = self.device_name
         self.device_name = device_name
         print(f"[AudioRouting] Setting device for {self.path.name}: {old or 'default'} -> {self.device_name or 'default'}")
         was_playing = self.playing
         pos = self.get_time_pos()
-        # stop & rebuild
         try:
+            # Stop, reopen file to reset internal pointer, create stream for new device
             self.stop()
-            # reopen file handle to reset read pointer reliably
             try:
                 if self.sf:
                     try:
@@ -330,17 +317,17 @@ class TrackPlayerSD:
                 self._open_file()
             except Exception as e:
                 print(f"[AudioRouting] Warning reopening file: {e}")
-            # seek to preserved pos
             try:
                 self.sf.seek(int(pos * self.sf.samplerate))
                 self.position = pos
             except Exception:
                 self.position = pos
-            # create stream for new device
             created = self._create_stream()
             if created and was_playing:
                 try:
                     self.play(start_pos=pos)
+                    # try to move the sink_input to target sink (pulsectl)
+                    self._try_move_sink_input_after_start()
                 except Exception as e:
                     print(f"[AudioRouting] Error restarting playback after device change: {e}")
             print(f"[AudioRouting] Device set for {self.path.name} -> {self.device_name or 'default'} (resolved index={self.device_index})")
@@ -378,6 +365,74 @@ class TrackPlayerSD:
             except Exception as e:
                 print(f"[AudioRouting] Error starting stream for {self.path.name}: {e}")
                 self.playing = False
+                return
+            # attempt pulsectl move shortly after stream start (best-effort)
+            self._try_move_sink_input_after_start()
+
+    def _try_move_sink_input_after_start(self):
+        if not PULSECTL_AVAILABLE or not self.pulse_client or not self.device_name:
+            return
+        # run in background to allow Pulse to create sink_input
+        def mover():
+            # give some time for sink_input to appear
+            time.sleep(0.08)
+            try:
+                sinks = self.pulse_client.sink_list()
+                # try to find sink by exact name or substring
+                target = None
+                for s in sinks:
+                    if self.device_name == s.name or (self.device_name in s.name):
+                        target = s
+                        break
+                if target is None:
+                    # check pactl sink names as fallback
+                    for s in sinks:
+                        if self.device_name.lower() in s.description.lower() or self.device_name.lower() in s.name.lower():
+                            target = s
+                            break
+                if not target:
+                    print(f"[AudioRouting] pulsectl: target sink '{self.device_name}' not found among sinks.")
+                    return
+                # gather sink_inputs list and try to find ones belonging to this process
+                sink_inputs = self.pulse_client.sink_input_list()
+                pidstr = str(os.getpid())
+                moved_any = False
+                for si in sink_inputs:
+                    proplist = si.proplist or {}
+                    # application process id might be present
+                    apid = proplist.get('application.process.id') or proplist.get('application.process.pid')
+                    # application.name or media.name can help
+                    media_name = proplist.get('media.name') or proplist.get('application.name') or ''
+                    if apid == pidstr or pidstr in (apid or '') or (self.path.name in media_name):
+                        if si.index in self.moved_sink_inputs:
+                            continue
+                        try:
+                            self.pulse_client.sink_input_move(si.index, target.index)
+                            self.moved_sink_inputs.add(si.index)
+                            print(f"[AudioRouting] Moved sink_input {si.index} ('{media_name}') -> {target.name}")
+                            moved_any = True
+                        except Exception as e:
+                            print(f"[AudioRouting] Failed to move sink_input {si.index} -> {target.name}: {e}")
+                if not moved_any:
+                    # if none matched by pid, try heuristics: choose most recent sink_input that matches our stream channels/samplerate
+                    for si in sink_inputs:
+                        if si.index in self.moved_sink_inputs:
+                            continue
+                        media_name = si.proplist.get('media.name') or si.proplist.get('application.name') or ''
+                        if self.path.name in media_name or self.path.stem in media_name:
+                            try:
+                                self.pulse_client.sink_input_move(si.index, target.index)
+                                self.moved_sink_inputs.add(si.index)
+                                print(f"[AudioRouting] Heuristic moved sink_input {si.index} ('{media_name}') -> {target.name}")
+                                moved_any = True
+                                break
+                            except Exception as e:
+                                print(f"[AudioRouting] Heuristic failed to move sink_input {si.index}: {e}")
+                if not moved_any:
+                    print(f"[AudioRouting] No matching sink_input found to move for '{self.path.name}' (pid={pidstr}).")
+            except Exception as e:
+                print(f"[AudioRouting] pulsectl mover exception: {e}")
+        threading.Thread(target=mover, daemon=True).start()
 
     def _stream_finished(self):
         self.playing = False
@@ -465,7 +520,7 @@ class TrackPlayerSD:
         return float(self.duration)
 
 # ---------------------------
-# Tick player (pygame fallback)
+# Tick player (unchanged)
 # ---------------------------
 class TickPlayer:
     def __init__(self, path: Optional[str] = None, vol: int = DEFAULT_TICK_VOL):
@@ -518,7 +573,7 @@ class TickPlayer:
             return False
 
 # ---------------------------
-# Timeline widget (pulse only inside loop, stronger)
+# Timeline widget (pulse only inside loop)
 # ---------------------------
 class Timeline(QWidget):
     seekRequested = pyqtSignal(float)
@@ -650,12 +705,13 @@ class Timeline(QWidget):
 # TrackRow UI (with Test button)
 # ---------------------------
 class TrackRow(QWidget):
-    def __init__(self, filepath: str, device_names: List[str], assigned_device=None, settings=None):
+    def __init__(self, filepath: str, device_names: List[str], assigned_device=None, settings=None, pulse_client=None):
         super().__init__()
         self.filepath = filepath
         self.device_names = device_names
         self.assigned_device = assigned_device
         self.settings = settings or {}
+        self.pulse_client = pulse_client
         self.player: Optional[TrackPlayerSD] = None
         self._build_ui()
         self._load_settings()
@@ -673,18 +729,14 @@ class TrackRow(QWidget):
         self.solo_cb = QCheckBox("Solo"); self.solo_cb.setFixedWidth(60)
         layout.addWidget(self.mute_cb); layout.addWidget(self.solo_cb)
         layout.addStretch()
-        # device combo: show names
         self.sink_combo = QComboBox()
         for name in self.device_names:
             self.sink_combo.addItem(name, name)
         self.sink_combo.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.sink_combo, 0)
-        # Test button
-        self.test_btn = QPushButton("Test")
-        self.test_btn.setFixedWidth(56)
+        self.test_btn = QPushButton("Test"); self.test_btn.setFixedWidth(56)
         layout.addWidget(self.test_btn)
 
-        # signals
         self.sink_combo.currentIndexChanged.connect(self._on_sink_changed)
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
         self.test_btn.clicked.connect(self._on_test_clicked)
@@ -704,9 +756,10 @@ class TrackRow(QWidget):
         self.player = player
         try:
             self.player.set_volume_db(self.vol_slider.value())
-            # if assigned device present in combo, already selected; else set device
             sel = self.sink_combo.currentData()
             if sel is not None:
+                # ensure player knows pulse_client for moving sink_input
+                self.player.pulse_client = self.pulse_client
                 self.player.set_device_by_name(sel)
         except Exception:
             pass
@@ -715,6 +768,7 @@ class TrackRow(QWidget):
         data = self.sink_combo.currentData()
         if self.player:
             try:
+                self.player.pulse_client = self.pulse_client
                 self.player.set_device_by_name(data)
             except Exception as e:
                 print(f"[AudioRouting] Failed setting device: {e}")
@@ -728,43 +782,82 @@ class TrackRow(QWidget):
                 pass
 
     def _on_test_clicked(self):
-        """Play a short sine tone on the selected device to test routing."""
         dev_name = self.sink_combo.currentData()
         if not SD_AVAILABLE:
             QMessageBox.information(self, "Info", "sounddevice is not available for Test tone.")
             return
         idx = find_sd_device_index_by_name(dev_name) if dev_name and dev_name!="default" else None
+        # We'll attempt to play a short tone via sd.play on the resolved index,
+        # then also try to move the sink_input via pulsectl to the named sink (best-effort).
         duration = 0.35
         sr = 44100
         t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-        freq = 880.0  # high test tone
+        freq = 880.0
         sine = 0.2 * np.sin(2 * np.pi * freq * t).astype('float32')
-        # stereo
         out = np.column_stack([sine, sine])
         try:
             sd.play(out, samplerate=sr, device=idx)
-            # non-blocking; stop after duration on a timer
+            # schedule stop
             threading.Timer(duration + 0.05, lambda: sd.stop()).start()
+            # try to move sink_input if pulsectl available
+            if PULSECTL_AVAILABLE and self.pulse_client and dev_name and dev_name!="default":
+                def mover():
+                    time.sleep(0.08)
+                    try:
+                        sinks = self.pulse_client.sink_list()
+                        target = None
+                        for s in sinks:
+                            if dev_name == s.name or dev_name in s.name:
+                                target = s; break
+                        if not target:
+                            for s in sinks:
+                                if dev_name.lower() in s.description.lower() or dev_name.lower() in s.name.lower():
+                                    target = s; break
+                        if not target:
+                            print(f"[AudioRouting] pulsectl test: target sink '{dev_name}' not found.")
+                            return
+                        sink_inputs = self.pulse_client.sink_input_list()
+                        pidstr = str(os.getpid())
+                        for si in sink_inputs:
+                            proplist = si.proplist or {}
+                            apid = proplist.get('application.process.id') or proplist.get('application.process.pid')
+                            media_name = proplist.get('media.name') or proplist.get('application.name') or ''
+                            if apid == pidstr or pidstr in (apid or '') or 'python' in (media_name or '').lower():
+                                try:
+                                    self.pulse_client.sink_input_move(si.index, target.index)
+                                    print(f"[AudioRouting] Test moved sink_input {si.index} -> {target.name}")
+                                except Exception as e:
+                                    print(f"[AudioRouting] Test move failed: {e}")
+                    except Exception as e:
+                        print(f"[AudioRouting] pulsectl test mover exception: {e}")
+                threading.Thread(target=mover, daemon=True).start()
         except Exception as e:
             QMessageBox.warning(self, "Test tone failed", f"Could not play test tone on device {dev_name}: {e}")
 
 # ---------------------------
-# Main Window
+# Main Window (similar to previous versions)
 # ---------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Multitrack Player v17 - sounddevice (name-based devices)")
+        self.setWindowTitle("Multitrack Player v17 - sounddevice + pulsectl")
         self.resize(1220, 860)
         self.setStyleSheet("QWidget { background-color: #2f2f2f; color: #e6e6e6 }")
 
-        # load global config
         self.global_cfg = load_global_config()
         self.global_tick = self.global_cfg.get('tick_file')
         self.global_playback_rate = float(self.global_cfg.get('playback_rate', 1.0))
         self.global_bpm = int(self.global_cfg.get('bpm', DEFAULT_BPM))
 
-        # device names list for combo boxes
+        # pulsectl client if available
+        self.pulse_client = None
+        if PULSECTL_AVAILABLE:
+            try:
+                self.pulse_client = pulsectl.Pulse('multitrack-player')
+            except Exception as e:
+                print(f"[AudioRouting] pulsectl init failed: {e}")
+                self.pulse_client = None
+
         self.device_names = build_output_device_list()
 
         self.settings = {}
@@ -822,7 +915,7 @@ class MainWindow(QMainWindow):
 
         # connect signals
         self.open_btn.clicked.connect(self.on_open)
-        self.refresh_btn.clicked.connect(self.on_refresh)
+        self.refresh_btn.clicked.connect(self.on_refresh_outputs)
         self.save_btn.clicked.connect(self.on_save)
         self.play_btn.clicked.connect(self.on_play)
         self.pause_btn.clicked.connect(self.on_pause)
@@ -838,7 +931,6 @@ class MainWindow(QMainWindow):
         self.bpm_spin.valueChanged.connect(lambda v: setattr(self, 'global_bpm', int(v)))
         self.tick_browse.clicked.connect(self.on_browse_tick)
         self.tick_vol_spin.valueChanged.connect(self.on_tick_vol_changed)
-        self.refresh_btn.clicked.connect(self.on_refresh_outputs)
 
     # ---------------------------
     # File & load tracks
@@ -865,12 +957,10 @@ class MainWindow(QMainWindow):
         self.tick_player.set_tick_file(self.global_tick)
         self.global_playback_rate = g.get('playback_rate', self.global_playback_rate)
         self._update_rate_label()
-        # refresh device names from system before load
         self.device_names = build_output_device_list()
         self.load_tracks(folder)
 
     def load_tracks(self, folder):
-        # cleanup old
         for p in self.track_players:
             try: p.stop()
             except Exception: pass
@@ -879,13 +969,12 @@ class MainWindow(QMainWindow):
             except Exception: pass
         self.track_rows = []; self.track_players = []
 
-        # refresh devices list
         self.device_names = build_output_device_list()
 
         files = [p for p in sorted(Path(folder).iterdir()) if p.suffix.lower() in AUDIO_EXTS]
         durations = []
         for pth in files:
-            row = TrackRow(str(pth), self.device_names, settings=self.settings)
+            row = TrackRow(str(pth), self.device_names, settings=self.settings, pulse_client=self.pulse_client)
             self.tracks_layout.addWidget(row)
             self.track_rows.append(row)
             assigned = None
@@ -893,12 +982,11 @@ class MainWindow(QMainWindow):
             if ent:
                 assigned = ent.get('sink')
             try:
-                tp = TrackPlayerSD(pth, device_name=assigned)
+                tp = TrackPlayerSD(pth, device_name=assigned, pulse_client=self.pulse_client)
                 tp.set_playback_rate(self.global_playback_rate)
                 row.set_player(tp)
                 self.track_players.append(tp)
                 durations.append(tp.get_duration())
-                # set combo to assigned if present
                 if assigned:
                     idx = row.sink_combo.findData(assigned)
                     if idx != -1:
@@ -911,7 +999,6 @@ class MainWindow(QMainWindow):
             maxdur = 10.0
         self.timeline.set_duration(maxdur)
 
-        # load loops
         g = self.settings.get('_global', {})
         loops = g.get('loops', {})
         self.loop_list = loops if loops else {}
@@ -944,12 +1031,8 @@ class MainWindow(QMainWindow):
                     r.sink_combo.setCurrentIndex(idx)
             r.sink_combo.blockSignals(False)
 
-    def on_refresh(self):
-        # compatibility alias
-        self.on_refresh_outputs()
-
     # ---------------------------
-    # Loop UI
+    # Loop UI & controls (unchanged)
     # ---------------------------
     def update_loop_dropdown(self):
         self.loop_select.blockSignals(True)
@@ -1017,18 +1100,17 @@ class MainWindow(QMainWindow):
         start = 0.0
         if self.loop_toggle.isChecked():
             start = self.timeline.loop_start
-        # apply selected devices & volumes & playback rate
         for idx, row in enumerate(self.track_rows):
             try:
                 tp = self.track_players[idx]
                 dev_name = row.sink_combo.currentData()
                 if dev_name is not None:
+                    tp.pulse_client = self.pulse_client
                     tp.set_device_by_name(dev_name)
                 tp.set_playback_rate(self.global_playback_rate)
                 tp.set_volume_db(row.vol_slider.value())
             except Exception as e:
                 print(f"[AudioRouting] Error applying settings to track {idx}: {e}")
-        # start playback
         for tp in self.track_players:
             try:
                 tp.play(start_pos=start)
@@ -1055,7 +1137,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_position(0.0)
 
     # ---------------------------
-    # Playback rate
+    # Playback rate (unchanged)
     # ---------------------------
     def _update_rate_label(self):
         self.rate_label.setText(f"{int(round(self.global_playback_rate*100))}%")
@@ -1079,7 +1161,7 @@ class MainWindow(QMainWindow):
         self._update_rate_label()
 
     # ---------------------------
-    # Tick handlers
+    # Tick handlers (unchanged)
     # ---------------------------
     def on_browse_tick(self):
         f = QFileDialog.getOpenFileName(self, "Select tick sound (global)", str(Path.home()), "Audio files (*.wav *.ogg *.mp3 *.flac)")[0]
@@ -1094,7 +1176,7 @@ class MainWindow(QMainWindow):
         self.global_cfg['tick_volume'] = int(v)
 
     # ---------------------------
-    # Save settings
+    # Save settings (unchanged)
     # ---------------------------
     def on_save(self):
         if not self.current_folder:
@@ -1125,7 +1207,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Saved", "Settings saved (folder + global).")
 
     # ---------------------------
-    # UI tick
+    # UI tick (unchanged logic)
     # ---------------------------
     def ui_tick(self):
         now = time.time()
@@ -1179,6 +1261,8 @@ def main():
         print("Warning: sounddevice not available. Install with `pip install sounddevice`.")
     if not SF_AVAILABLE:
         print("Warning: soundfile not available. Install with `pip install soundfile`.")
+    if not PULSECTL_AVAILABLE:
+        print("Info: pulsectl not installed — sink-moving will be disabled. Install with `pip install pulsectl` for reliable routing.")
     app = QApplication(sys.argv)
     mw = MainWindow()
     mw.show()
