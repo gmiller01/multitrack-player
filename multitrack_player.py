@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# multitrack_player_v15.py
-# Multitrack Player v15 - PyQt6 + sounddevice multi-output streaming
-# - per-track output routing using sounddevice OutputStream
-# - global tick config in ~/.config/multitrack_player/config.json
-# - pulsing loop & pulsing progress bar inside loop
-# - playback_rate applied via simple resampling (linear interp)
+# multitrack_player_v16.py
+# Multitrack Player v16 - PyQt6 + sounddevice (fixed routing & pulsing)
+# - LC_NUMERIC fix
+# - per-track device switching -> stream rebuild preserving position
+# - green progress pulsing ONLY inside loop and stronger
+# - console routing/debug messages printed as [AudioRouting]
 
 import os
 import locale
@@ -99,17 +99,16 @@ def list_pactl_sinks():
     except Exception:
         # fallback: list sounddevice devices (names)
         if SD_AVAILABLE:
-            devs = sd.query_devices()
-            sinks = []
-            for i, d in enumerate(devs):
-                # treat any output-capable device
-                if d['max_output_channels'] > 0:
-                    sinks.append((str(i), d['name']))
-            return sinks
+            try:
+                devs = sd.query_devices()
+                sinks = []
+                for i, d in enumerate(devs):
+                    if d['max_output_channels'] > 0:
+                        sinks.append((str(i), d['name']))
+                return sinks
+            except Exception:
+                return []
         return []
-
-def semitone_to_scale(semitones):
-    return 2.0 ** (float(semitones) / 12.0)
 
 def get_audio_duration(path: Path) -> float:
     if MUTAGEN_AVAILABLE:
@@ -119,7 +118,6 @@ def get_audio_duration(path: Path) -> float:
                 return float(f.info.length)
         except Exception:
             pass
-    # ffprobe fallback
     try:
         out = subprocess.check_output([
             'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -129,11 +127,7 @@ def get_audio_duration(path: Path) -> float:
     except Exception:
         return 0.0
 
-# ---------------------------
-# Audio helpers: decoding & streaming
-# ---------------------------
 def decode_with_ffmpeg_to_wav(src_path: Path, dest_path: Path):
-    """Use ffmpeg to decode src to WAV (16-bit PCM) into dest_path."""
     cmd = [
         "ffmpeg", "-y", "-v", "error", "-i", str(src_path),
         "-ar", "48000", "-ac", "2", "-f", "wav", str(dest_path)
@@ -141,14 +135,12 @@ def decode_with_ffmpeg_to_wav(src_path: Path, dest_path: Path):
     subprocess.check_call(cmd)
 
 def open_soundfile_with_fallback(path: Path):
-    """Try opening with soundfile. If fails (e.g. mp3), decode via ffmpeg to temp wav and open that."""
     if not SF_AVAILABLE:
-        raise RuntimeError("soundfile (pysoundfile) is required for sounddevice playback.")
+        raise RuntimeError("soundfile (pysoundfile) is required.")
     try:
         sf_obj = sf.SoundFile(str(path))
         return sf_obj, None
     except Exception:
-        # try ffmpeg fallback
         tmp = tempfile.NamedTemporaryFile(prefix="mtp_dec_", suffix=".wav", delete=False)
         tmp.close()
         try:
@@ -156,7 +148,6 @@ def open_soundfile_with_fallback(path: Path):
             sf_obj = sf.SoundFile(tmp.name)
             return sf_obj, tmp.name
         except Exception as e:
-            # cleanup
             try:
                 os.unlink(tmp.name)
             except Exception:
@@ -168,60 +159,144 @@ def open_soundfile_with_fallback(path: Path):
 # ---------------------------
 class TrackPlayerSD:
     """Stream audio file to selected device via sounddevice OutputStream.
-       Supports simple playback_rate by resampling blocks (linear interp)."""
-    def __init__(self, path: Path, device_index: Optional[int] = None):
+       Supports simple playback_rate by resampling blocks (linear interp).
+       Handles device switching by rebuilding stream preserving position."""
+    def __init__(self, path: Path, device: Optional[object] = None):
         self.path = Path(path)
-        self.device_index = device_index
+        self.device = device  # can be int index or string name
         self.sf = None
         self._temp_wav = None
         self.stream = None
         self.lock = threading.Lock()
         self.playing = False
-        self.position = 0.0  # seconds
+        self.position = 0.0
         self.duration = 0.0
         self.playback_rate = 1.0
         self.blocksize = 4096
         self.channels = 2
         self.samplerate = 48000
         self.stop_flag = threading.Event()
+        self.volume = 1.0
         self._open_file()
 
     def _open_file(self):
         if not SF_AVAILABLE:
             raise RuntimeError("soundfile not installed")
-        sf_obj = None
-        tmp_path = None
         try:
             sf_obj, tmp = open_soundfile_with_fallback(self.path)
             self.sf = sf_obj
             self._temp_wav = tmp
             self.channels = self.sf.channels
             self.samplerate = int(self.sf.samplerate)
-            # Duration
             try:
                 self.duration = float(len(self.sf) / self.sf.samplerate)
             except Exception:
-                # fallback using get_audio_duration
                 self.duration = get_audio_duration(self.path)
         except Exception as e:
             raise RuntimeError(f"Unable to open audio file {self.path}: {e}")
 
-    def set_device(self, device_index: Optional[int]):
-        """Set sounddevice device index (int) or None for default."""
-        self.device_index = device_index
-        # If a stream is running, restart it to apply device change
-        if self.playing:
+    def _device_repr(self, device):
+        if device is None:
+            return "default"
+        return str(device)
+
+    def _create_stream(self):
+        """Create OutputStream with current device, samplerate, channels and callback."""
+        if not SD_AVAILABLE:
+            raise RuntimeError("sounddevice is required")
+        # If there is an existing stream, close it first
+        if self.stream:
+            try:
+                self.stream.stop(); self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        dev_arg = None
+        if self.device is not None:
+            # device might be pactl index string or sounddevice index int
+            try:
+                # if string is numeric -> int index to sd
+                if isinstance(self.device, str) and self.device.isdigit():
+                    dev_arg = int(self.device)
+                else:
+                    dev_arg = self.device
+            except Exception:
+                dev_arg = self.device
+        try:
+            self.stream = sd.OutputStream(
+                samplerate=self.samplerate,
+                blocksize=self.blocksize,
+                device=dev_arg,
+                channels=self.channels,
+                dtype='float32',
+                callback=self._callback,
+                finished_callback=self._stream_finished
+            )
+            return True
+        except Exception as e:
+            # fallback: try without device argument
+            try:
+                print(f"[AudioRouting] Warning: failed to open device {self._device_repr(self.device)} -> {e}. Falling back to default device.")
+                self.stream = sd.OutputStream(
+                    samplerate=self.samplerate,
+                    blocksize=self.blocksize,
+                    channels=self.channels,
+                    dtype='float32',
+                    callback=self._callback,
+                    finished_callback=self._stream_finished
+                )
+                return True
+            except Exception as e2:
+                print(f"[AudioRouting] Failed to create stream: {e2}")
+                self.stream = None
+                return False
+
+    def set_device(self, device: Optional[object]):
+        """Set device and rebuild stream preserving playback position & state."""
+        old = self.device
+        self.device = device
+        print(f"[AudioRouting] Setting device for {self.path.name}: {self._device_repr(old)} -> {self._device_repr(device)}")
+        was_playing = self.playing
+        pos = self.get_time_pos()
+        # rebuild: stop stream and re-open file at current position
+        try:
             self.stop()
-            time.sleep(0.02)
-            self.play(start_pos=self.position)
+            # reopen file handle (ensure seekable)
+            try:
+                # reopen underlying soundfile to reset state
+                if self.sf:
+                    try:
+                        self.sf.close()
+                    except Exception:
+                        pass
+                self._open_file()
+            except Exception as e:
+                print(f"[AudioRouting] Warning: failed to reopen file: {e}")
+            # set position then create stream
+            try:
+                self.sf.seek(int(pos * self.sf.samplerate))
+                self.position = pos
+            except Exception:
+                # fallback: set position variable, callback will read from current file pos
+                self.position = pos
+            created = self._create_stream()
+            if created and was_playing:
+                # start streaming at preserved position
+                try:
+                    self.play(start_pos=pos)
+                except Exception as e:
+                    print(f"[AudioRouting] Error restarting playback after device change: {e}")
+            print(f"[AudioRouting] Device set for {self.path.name} -> {self._device_repr(device)}")
+        except Exception as e:
+            print(f"[AudioRouting] Exception in set_device: {e}")
 
     def set_playback_rate(self, rate: float):
         with self.lock:
-            self.playback_rate = rate
+            self.playback_rate = float(rate)
 
     def set_volume_db(self, vol_pct: float):
-        # simple: map 0..120 to linear gain (0..1.2). More advanced mapping optional.
-        self.volume = max(0.0, float(vol_pct) / 100.0)
+        with self.lock:
+            self.volume = max(0.0, float(vol_pct) / 100.0)
 
     def play(self, start_pos: float = 0.0):
         if not SD_AVAILABLE or not SF_AVAILABLE:
@@ -229,94 +304,67 @@ class TrackPlayerSD:
         with self.lock:
             self.stop_flag.clear()
             self.playing = True
-            self.sf.seek(int(start_pos * self.sf.samplerate))
-            self.position = start_pos
-            # create stream
-            target_sr = self.sf.samplerate
-            channels = self.sf.channels
-            dev = int(self.device_index) if (self.device_index is not None and str(self.device_index).isdigit()) else None
+            # ensure file handle open and positioned
             try:
-                self.stream = sd.OutputStream(
-                    samplerate=target_sr,
-                    blocksize=self.blocksize,
-                    device=dev,
-                    channels=channels,
-                    dtype='float32',
-                    callback=self._callback,
-                    finished_callback=self._stream_finished
-                )
-                self.stream.start()
-            except Exception as e:
-                # Try with default device without device argument
-                try:
-                    self.stream = sd.OutputStream(
-                        samplerate=target_sr,
-                        blocksize=self.blocksize,
-                        channels=channels,
-                        dtype='float32',
-                        callback=self._callback,
-                        finished_callback=self._stream_finished
-                    )
-                    self.stream.start()
-                except Exception as e2:
-                    print("Failed to start OutputStream:", e, e2)
+                self.sf.seek(int(start_pos * self.sf.samplerate))
+            except Exception:
+                pass
+            self.position = start_pos
+            # create stream if not exists
+            if not self.stream:
+                created = self._create_stream()
+                if not created:
+                    print(f"[AudioRouting] Failed to create stream for {self.path.name}, cannot play.")
                     self.playing = False
+                    return
+            try:
+                # start stream (if not started)
+                if not self.stream.active:
+                    self.stream.start()
+            except Exception as e:
+                print(f"[AudioRouting] Error starting stream for {self.path.name}: {e}")
+                self.playing = False
 
     def _stream_finished(self):
         self.playing = False
 
     def _callback(self, outdata, frames, time_info, status):
-        """sounddevice callback: fill outdata (frames x channels) with audio (float32)."""
         if self.stop_flag.is_set():
-            outdata[:] = np.zeros((frames, self.sf.channels), dtype='float32')
+            outdata[:] = np.zeros((frames, self.channels), dtype='float32')
             raise sd.CallbackStop()
-        # Read enough frames from file considering playback_rate
         with self.lock:
             rate = float(self.playback_rate)
-            vol = getattr(self, 'volume', 1.0)
-        # Calculate how many source frames we need to produce 'frames' output frames after resampling
-        # source_frames_needed = ceil(frames * (1 / rate))
-        src_frames_needed = int(np.ceil(frames / rate)) + 2
+            vol = float(self.volume)
+        # compute required source frames
+        src_frames_needed = int(np.ceil(frames / max(1e-6, rate))) + 4
         try:
             src = self.sf.read(frames=src_frames_needed, dtype='float32', always_2d=True)
             if src.size == 0:
-                # EOF -> stop
-                outdata[:] = np.zeros((frames, self.sf.channels), dtype='float32')
+                outdata[:] = np.zeros((frames, self.channels), dtype='float32')
                 raise sd.CallbackStop()
-            # perform linear resampling from src to frames
             src_len = src.shape[0]
             if rate == 1.0:
-                # direct copy (may have fewer frames)
                 if src_len >= frames:
                     out = src[:frames]
                 else:
-                    # pad zeros
                     out = np.zeros((frames, src.shape[1]), dtype='float32')
                     out[:src_len] = src
             else:
-                # create position indices in source corresponding to output frames
-                src_pos = np.linspace(0, max(0, src_len - 1), num=frames) * (1.0 / rate)
-                # but safer: map output frame i to source position i / rate
+                # map output positions to source positions
                 src_pos = (np.arange(frames) / rate)
-                # If src doesn't contain enough frames for desired positions, read fewer or pad
-                # We'll use numpy.interp per channel (simple linear)
+                # ensure interpolation range
+                xs = np.arange(src_len)
                 out = np.zeros((frames, src.shape[1]), dtype='float32')
                 for ch in range(src.shape[1]):
-                    # x coords for src: 0..src_len-1
-                    xs = np.arange(src_len)
                     ys = src[:, ch]
-                    # for positions beyond src_len-1, interp uses last value; to avoid that, pad with 0
-                    # create xp and fp with extra zero at end
                     xp = np.concatenate([xs, [xs[-1] + 1]])
                     fp = np.concatenate([ys, [0.0]])
                     out[:, ch] = np.interp(src_pos, xp, fp).astype('float32')
-            # apply volume scalar
             out *= vol
-            # update position in seconds
+            # update logical position (in seconds) considering playback_rate
             self.position += frames / float(self.sf.samplerate) * rate
-            # ensure outdata shape matches expected channels (sounddevice expects matching channels)
+            # match output channels
             if out.shape[1] < outdata.shape[1]:
-                # pad channels
                 pad = np.zeros((frames, outdata.shape[1] - out.shape[1]), dtype='float32')
                 out = np.concatenate([out, pad], axis=1)
             elif out.shape[1] > outdata.shape[1]:
@@ -325,18 +373,18 @@ class TrackPlayerSD:
         except sd.CallbackStop:
             raise
         except Exception as e:
-            print("Stream callback error:", e)
+            print(f"[AudioRouting] Stream callback error for {self.path.name}: {e}")
             outdata[:] = np.zeros((frames, outdata.shape[1]), dtype='float32')
             raise sd.CallbackStop()
 
     def seek(self, seconds: float):
         with self.lock:
-            pos_frames = int(seconds * self.sf.samplerate)
             try:
+                pos_frames = int(seconds * self.sf.samplerate)
                 self.sf.seek(pos_frames)
                 self.position = seconds
             except Exception:
-                pass
+                self.position = seconds
 
     def stop(self):
         self.stop_flag.set()
@@ -349,7 +397,6 @@ class TrackPlayerSD:
                     pass
         finally:
             self.playing = False
-            # close file and temporary wav
             try:
                 if self.sf:
                     self.sf.close()
@@ -360,6 +407,7 @@ class TrackPlayerSD:
                     os.unlink(self._temp_wav)
                 except Exception:
                     pass
+            self.stream = None
 
     def get_time_pos(self):
         return float(self.position)
@@ -421,7 +469,7 @@ class TickPlayer:
             return False
 
 # ---------------------------
-# Timeline widget with pulsing of loop and progress inside loop
+# Timeline widget (pulse only inside loop, stronger)
 # ---------------------------
 class Timeline(QWidget):
     seekRequested = pyqtSignal(float)
@@ -435,8 +483,9 @@ class Timeline(QWidget):
         self.loop_end = self.duration
         self.dragging = None
         self.pulse_phase = 0.0
-        self.pulse_speed = 2 * pi / 2.0  # 2 seconds
-        self.setMinimumHeight(60)
+        # default pulse speed -> 2s period
+        self.pulse_speed = 2 * pi / 2.0
+        self.setMinimumHeight(64)
         self.setMouseTracking(True)
 
     def set_duration(self, d: float):
@@ -476,33 +525,38 @@ class Timeline(QWidget):
 
         lsx = x_for(self.loop_start)
         lex = x_for(self.loop_end)
-        base_alpha = 80
-        pulse_alpha = int(base_alpha + 60 * (0.5 + 0.5 * sin(self.pulse_phase)))
+        base_alpha = 90
+        pulse_alpha = int(base_alpha + 120 * (0.5 + 0.5 * sin(self.pulse_phase)))  # stronger amplitude
         loop_alpha = base_alpha
+        # Only pulse loop background if position is inside loop
         if self.loop_start <= self.position <= self.loop_end:
             loop_alpha = pulse_alpha
         p.setBrush(QColor(80, 160, 200, loop_alpha))
         p.drawRect(QRectF(lsx, bar_y, max(4.0, lex - lsx), bar_h))
 
-        # progress bar (pulser inside loop)
+        # progress bar - pulse only if in loop AND looping enabled (so user sees active loop)
         posx = x_for(self.position)
         prog_rect = QRectF(10.0, bar_y, max(2.0, posx - 10.0), bar_h)
         prog_base_alpha = 200
-        prog_pulse = int(55 * (0.5 + 0.5 * sin(self.pulse_phase))) if (self.loop_start <= self.position <= self.loop_end) else 0
+        prog_pulse = 0
+        # check also that loop has positive width
+        if (self.loop_end - self.loop_start) > 0.001 and (self.loop_start <= self.position <= self.loop_end):
+            prog_pulse = int(100 * (0.5 + 0.5 * sin(self.pulse_phase)))  # quite visible
         prog_alpha = min(255, prog_base_alpha + prog_pulse)
-        col = QColor(102, 187, 106)  # green
+        col = QColor(102, 187, 106)
         col.setAlpha(prog_alpha)
         p.setBrush(col)
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(prog_rect)
 
-        # handles
+        # handles (left and right)
         handle_w = 10.0; handle_h = 18.0
         p.setBrush(QColor("#bbbbbb"))
         p.setPen(QPen(QColor("#888888")))
         p.drawRect(QRectF(lsx - handle_w/2.0, bar_y - handle_h/2.0 + bar_h/2.0, handle_w, handle_h))
         p.drawRect(QRectF(lex - handle_w/2.0, bar_y - handle_h/2.0 + bar_h/2.0, handle_w, handle_h))
 
+        # play cursor
         p.setPen(QPen(QColor("#ffffff"), 2))
         p.drawLine(QPointF(posx, bar_y - 6.0), QPointF(posx, bar_y + bar_h + 6.0))
 
@@ -529,7 +583,8 @@ class Timeline(QWidget):
         self.seekRequested.emit(newt)
 
     def mouseMoveEvent(self, ev):
-        if not self.dragging: return
+        if not self.dragging:
+            return
         x = float(ev.position().x()); w = float(self.rect().width())
         def t_from_x(xv): return (xv - 10.0) / max(1.0, (w - 20.0)) * self.duration
         t = max(0.0, min(self.duration, t_from_x(x)))
@@ -559,7 +614,7 @@ class TrackRow(QWidget):
         self.sinks = sinks
         self.assigned_sink = assigned_sink
         self.settings = settings or {}
-        self.player = None  # TrackPlayerSD instance created in MainWindow.load_tracks
+        self.player = None
         self.current_volume = 100
         self._build_ui()
         self._load_settings()
@@ -579,14 +634,12 @@ class TrackRow(QWidget):
         layout.addStretch()
         self.sink_combo = QComboBox()
         for s in self.sinks:
-            self.sink_combo.addItem(s[1], s[0])  # display name, data=index
+            self.sink_combo.addItem(s[1], s[0])
         self.sink_combo.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.sink_combo, 0)
 
         self.sink_combo.currentIndexChanged.connect(self._on_sink_changed)
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
-        self.mute_cb.toggled.connect(lambda st: None)
-        self.solo_cb.toggled.connect(lambda st: None)
 
     def _load_settings(self):
         n = Path(self.filepath).name
@@ -601,7 +654,6 @@ class TrackRow(QWidget):
 
     def set_player(self, player: TrackPlayerSD):
         self.player = player
-        # apply initial volume & sink
         try:
             self.player.set_volume_db(self.vol_slider.value())
         except Exception:
@@ -609,21 +661,20 @@ class TrackRow(QWidget):
 
     def _on_sink_changed(self, idx):
         data = self.sink_combo.currentData()
-        # data is sink index as string (from pactl) or device index int if fallback
         if self.player:
             try:
-                # try to interpret as int device index; else pass as string to set_device
+                # interpret numeric string as int index for sounddevice if possible
                 try:
                     didx = int(data)
                 except Exception:
                     didx = data
+                # set device (will rebuild stream and resume)
                 self.player.set_device(didx)
             except Exception as e:
-                print("Failed setting device:", e)
+                print(f"[AudioRouting] Failed setting device: {e}")
 
     def _on_volume_changed(self, val):
         self.vol_label.setText(f"{int(val)}%")
-        self.current_volume = int(val)
         if self.player:
             try:
                 self.player.set_volume_db(val)
@@ -636,21 +687,23 @@ class TrackRow(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Multitrack Player v15 - sounddevice")
-        self.resize(1200, 820)
+        self.setWindowTitle("Multitrack Player v16 - sounddevice")
+        self.resize(1220, 860)
         self.setStyleSheet("QWidget { background-color: #2f2f2f; color: #e6e6e6 }")
 
-        # globals
+        # load global config
         self.global_cfg = load_global_config()
         self.global_tick = self.global_cfg.get('tick_file')
         self.global_playback_rate = float(self.global_cfg.get('playback_rate', 1.0))
         self.global_bpm = int(self.global_cfg.get('bpm', DEFAULT_BPM))
 
         self.sinks = list_pactl_sinks()
-        # if no sinks via pactl, fallback to sounddevice device names
         if not self.sinks and SD_AVAILABLE:
-            devs = sd.query_devices()
-            self.sinks = [(str(i), d['name']) for i,d in enumerate(devs) if d['max_output_channels']>0]
+            try:
+                devs = sd.query_devices()
+                self.sinks = [(str(i), d['name']) for i,d in enumerate(devs) if d['max_output_channels']>0]
+            except Exception:
+                self.sinks = []
 
         self.settings = {}
         self.current_folder = None
@@ -705,7 +758,7 @@ class MainWindow(QMainWindow):
         self.tracks_area = QScrollArea(); self.tracks_widget = QWidget(); self.tracks_layout = QVBoxLayout(); self.tracks_widget.setLayout(self.tracks_layout)
         self.tracks_area.setWidgetResizable(True); self.tracks_area.setWidget(self.tracks_widget); v.addWidget(self.tracks_area)
 
-        # connect
+        # connect signals
         self.open_btn.clicked.connect(self.on_open)
         self.refresh_btn.clicked.connect(self.on_refresh)
         self.save_btn.clicked.connect(self.on_save)
@@ -742,7 +795,6 @@ class MainWindow(QMainWindow):
                 self.settings = {}
         else:
             self.settings = {}
-        # load global folder-specific settings
         g = self.settings.get('_global', {})
         if g.get('tick_file'):
             self.global_tick = g.get('tick_file')
@@ -765,8 +817,11 @@ class MainWindow(QMainWindow):
         # refresh sinks
         self.sinks = list_pactl_sinks()
         if not self.sinks and SD_AVAILABLE:
-            devs = sd.query_devices()
-            self.sinks = [(str(i), d['name']) for i,d in enumerate(devs) if d['max_output_channels']>0]
+            try:
+                devs = sd.query_devices()
+                self.sinks = [(str(i), d['name']) for i,d in enumerate(devs) if d['max_output_channels']>0]
+            except Exception:
+                self.sinks = []
 
         files = [p for p in sorted(Path(folder).iterdir()) if p.suffix.lower() in AUDIO_EXTS]
         durations = []
@@ -774,13 +829,12 @@ class MainWindow(QMainWindow):
             row = TrackRow(str(pth), self.sinks, settings=self.settings)
             self.tracks_layout.addWidget(row)
             self.track_rows.append(row)
-            # create TrackPlayerSD for each
-            # determine assigned sink from settings
+            # assigned sink from settings
             assigned = None
             ent = self.settings.get(Path(pth).name, {})
             if ent:
                 assigned = ent.get('sink')
-            # map assigned sink: if assigned corresponds to pactl index string, use that; else try int index
+            # interpret assigned: numeric -> index, else string
             devidx = None
             if assigned is not None:
                 try:
@@ -788,18 +842,17 @@ class MainWindow(QMainWindow):
                 except Exception:
                     devidx = assigned
             try:
-                tp = TrackPlayerSD(pth, device_index=devidx)
+                tp = TrackPlayerSD(pth, device=devidx)
                 tp.set_playback_rate(self.global_playback_rate)
                 row.set_player(tp)
                 self.track_players.append(tp)
                 durations.append(tp.get_duration())
-                # select sink combo if assigned
                 if assigned is not None:
                     idx = row.sink_combo.findData(assigned)
                     if idx != -1:
                         row.sink_combo.setCurrentIndex(idx)
             except Exception as e:
-                print("Failed to init TrackPlayerSD:", e)
+                print(f"[AudioRouting] Failed to init TrackPlayerSD for {pth.name}: {e}")
         self.tracks_layout.addStretch(1)
         maxdur = max(durations) if durations else 10.0
         if not maxdur or maxdur <= 1.0:
@@ -861,7 +914,6 @@ class MainWindow(QMainWindow):
         idx = self.loop_select.findText(name)
         if idx != -1:
             self.loop_select.setCurrentIndex(idx)
-        # store in settings memory
         if '_global' not in self.settings:
             self.settings['_global'] = {}
         self.settings['_global']['last_used_loop'] = name
@@ -896,7 +948,6 @@ class MainWindow(QMainWindow):
             self.timeline.set_position(start)
 
     def on_loop_changed(self, s, e):
-        # manual loop change -> not auto-named
         self.current_loop_name = None
 
     # ---------------------------
@@ -921,14 +972,14 @@ class MainWindow(QMainWindow):
                     tp.set_device(didx)
                 tp.set_playback_rate(self.global_playback_rate)
                 tp.set_volume_db(row.vol_slider.value())
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[AudioRouting] Error applying settings to track {idx}: {e}")
         # start streams
         for tp in self.track_players:
             try:
                 tp.play(start_pos=start)
             except Exception as e:
-                print("Error starting track:", e)
+                print(f"[AudioRouting] Error starting track: {e}")
         # ensure UI reflects correct position
         self.timeline.set_position(start)
 
@@ -996,7 +1047,6 @@ class MainWindow(QMainWindow):
         if not self.current_folder:
             QMessageBox.information(self, "Info", "No folder opened")
             return
-        # save folder-specific
         data = {}
         for idx, row in enumerate(self.track_rows):
             key = Path(row.filepath).name
@@ -1032,7 +1082,6 @@ class MainWindow(QMainWindow):
         self.timeline.advance_pulse(dt)
         if not self.track_players:
             return
-        # take primary player's position as source of truth
         try:
             pos = self.track_players[0].get_time_pos()
         except Exception:
@@ -1048,7 +1097,7 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
                 self.timeline.set_position(start)
-        # update duration if available
+        # update duration
         try:
             dur = self.track_players[0].get_duration()
             if dur and dur > 0:
@@ -1069,7 +1118,6 @@ class MainWindow(QMainWindow):
                 tp.stop()
         except Exception:
             pass
-        # save global config automatically on exit
         save_global_config(self.global_cfg)
         super().closeEvent(ev)
 
