@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QFileDialog, QScrollArea, QComboBox, QSlider,
     QCheckBox, QLineEdit, QMessageBox, QSpinBox, QInputDialog, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QColor, QPainter, QPen, QRectF, QPointF
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRectF, QPointF
+from PyQt6.QtGui import QFontMetrics, QColor, QPainter, QPen
 
 # locale fix
 import locale
@@ -511,7 +511,8 @@ class MainWindow(QMainWindow):
         self.default_btn.clicked.connect(self.on_set_default_folder)
         self.settings_btn.clicked.connect(self.on_settings)
         self.refresh_btn.clicked.connect(self.on_refresh)
-        self.save_btn.clicked.connect(self.on_save)
+        #self.save_btn.clicked.connect(self.on_save)
+        self.save_btn.clicked.connect(self._save_project_settings)
         self.play_btn.clicked.connect(self.on_play)
         self.stop_btn.clicked.connect(self.on_stop)
         self.rate_plus.clicked.connect(self.on_rate_plus)
